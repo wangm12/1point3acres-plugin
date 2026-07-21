@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>一亩三分地每日助手</title>
+    <link rel="stylesheet" href="popup.css">
+    <script src="shared/protocol.js" defer></script>
+    <script src="popup.js" defer></script>
+  </head>
+  <body>
+    <main class="app" role="main" aria-labelledby="popup-title">
+      <header class="header">
+        <p class="eyebrow">每日助手</p>
+        <h1 id="popup-title">一亩三分地每日助手</h1>
+        <p class="description">本地学习只保存在这台设备，不上传账号数据。</p>
+      </header>
+
+      <section class="actions" aria-label="快捷操作">
+        <button id="run-everything" type="button">一键签到&amp;打卡</button>
+      </section>
+
+      <p id="status" class="status" aria-live="polite"></p>
+    </main>
+  </body>
+</html>

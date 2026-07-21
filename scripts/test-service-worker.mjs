@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+import fs from 'node:fs'; import vm from 'node:vm';
+const store = { 'p3a-learned-answers-v1': [] }; let listener;
+const context = { globalThis: {}, console, fetch: async () => ({ ok: true, json: async () => ({ entries: [{ id: 'public', question: 'Q?', answers: ['Public'] }] }) }), chrome: { runtime: { getURL: (p) => p, onMessage: { addListener: (fn) => { listener = fn; } } }, storage: { local: { get: async (key) => ({ [key]: store[key] }), set: async (value) => Object.assign(store, value) } } } };
+const originalGet = context.chrome.storage.local.get;
+const originalSet = context.chrome.storage.local.set;
+vm.createContext(context);
+context.globalThis = context;
+context.importScripts = (...files) => files.forEach((file) => vm.runInContext(fs.readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8'), context));
+vm.runInContext(fs.readFileSync(new URL('../src/service-worker.js', import.meta.url), 'utf8'), context);
+const assert = (v, m) => { if (!v) throw new Error(m); }; const send = (type, payload) => new Promise((resolve) => listener({ type, payload }, {}, resolve));
+let response = await send('LOOKUP_QUESTION', { question: 'Q?', options: ['Public'] }); assert(response.ok && response.payload.status === 'matched', 'lookup');
+response = await send('SAVE_LEARNED_ANSWER', { question: 'Q?', answer: 'Local' }); assert(response.ok, 'save');
+response = await send('LOOKUP_QUESTION', { question: 'Q?', options: ['Public'] }); assert(response.payload.source === 'public', 'fallback');
+response = await send('LOOKUP_QUESTION', { question: 'Q?', options: ['Public', 'Other'] }); assert(response.payload.status === 'matched', 'public regression');
+response = await send('SAVE_LEARNED_ANSWER', { question: '', answer: 'x' }); assert(!response.ok, 'bad payload');
+context.chrome.storage.local.get = async () => { throw new Error('storage down'); }; response = await send('LOOKUP_QUESTION', { question: 'Q?', options: ['Public'] }); assert(!response.ok && response.payload.reason === 'lookup-error', 'storage error');
+context.chrome.storage.local.get = originalGet;
+context.chrome.storage.local.set = async () => { throw new Error('storage write down'); };
+response = await send('SAVE_LEARNED_ANSWER', { question: 'Q?', answer: 'Local' }); assert(!response.ok, 'storage write error');
+context.chrome.storage.local.set = originalSet;
+console.log('service worker tests passed.');

@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "一亩三分地每日助手",
+  "version": "0.1.0",
+  "description": "在一亩三分地每日答题和签到页面提供本地学习与人工确认辅助。",
+  "icons": {
+    "16": "assets/1point3acres-helper-icon-16.png",
+    "32": "assets/1point3acres-helper-icon-32.png",
+    "48": "assets/1point3acres-helper-icon-48.png",
+    "128": "assets/1point3acres-helper-icon-128.png"
+  },
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_title": "一亩三分地每日助手",
+    "default_icon": {
+      "16": "assets/1point3acres-helper-icon-16.png",
+      "32": "assets/1point3acres-helper-icon-32.png",
+      "48": "assets/1point3acres-helper-icon-48.png",
+      "128": "assets/1point3acres-helper-icon-128.png"
+    }
+  },
+  "background": {
+    "service_worker": "src/service-worker.js"
+  },
+  "permissions": [
+    "storage",
+    "notifications"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.1point3acres.com/next/daily-question*",
+        "https://www.1point3acres.com/next/daily-checkin*"
+      ],
+      "js": [
+        "src/shared/protocol.js",
+      "src/shared/question-matcher.js",
+        "src/shared/learned-answers.js",
+        "src/shared/daily-question-page.js",
+      "src/shared/daily-checkin-page.js",
+      "src/shared/checkin-state.js",
+        "src/content.js"
+      ],
+      "css": [
+        "src/content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+import fs from 'node:fs';
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+const source = fs.readFileSync(new URL('../src/shared/checkin-state.js', import.meta.url), 'utf8');
+const sandbox = { globalThis: null }; sandbox.globalThis = sandbox; vm.runInNewContext(source, sandbox);
+const node = (text, value = 'x') => ({ textContent: text, getAttribute(name) { return name === 'value' ? value : ''; } });
+const oldNode = node('只想签到拿米');
+const prepared = sandbox.CheckinState.prepare(oldNode, 'https://www.1point3acres.com/next/daily-checkin');
+const repaintedNode = node('只想签到拿米');
+assert(sandbox.CheckinState.reconcile(prepared, prepared.href, repaintedNode));
+assert(sandbox.CheckinState.canConfirm(prepared, prepared.href, repaintedNode, {}));
+assert.equal(sandbox.CheckinState.reconcile(prepared, prepared.href, node('其他签到')), null);
+assert.equal(sandbox.CheckinState.reconcile(prepared, `${prepared.href}/changed`, repaintedNode), null);
+console.log('checkin state tests passed.');

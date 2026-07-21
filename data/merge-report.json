@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-07-17T04:35:17.820Z",
+  "sourceCount": 10,
+  "successfulSources": 10,
+  "failedSources": 0,
+  "rawRecordCount": 1304,
+  "normalizedEntryCount": 198,
+  "deduplicatedRecordCount": 1106,
+  "ambiguousEntryCount": 11,
+  "conflictCount": 4,
+  "unrecognizedMarkdownBlocks": 0,
+  "unresolvedBySource": [
+    {
+      "sourceId": "eagleoflqj/p1a3_script/QA.js",
+      "unrecognizedMarkdownBlocks": 0,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "sourceId": "VividLau/1p3a_python_script/question_list.json",
+      "unrecognizedMarkdownBlocks": 0,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "sourceId": "Hanyang-Li/BotFarmer-1point3acres/bot-farmer-local/cheat_sheet.json",
+      "unrecognizedMarkdownBlocks": 0,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "sourceId": "tingyincc/auto_1p3a/question_list.json",
+      "unrecognizedMarkdownBlocks": 0,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "sourceId": "zxc2012/1p3a_signin/src/questions.py",
+      "unrecognizedMarkdownBlocks": 0,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "sourceId": "timerring/CloudCheckin/onepoint3acres/questions.py",
+      "unrecognizedMarkdownBlocks": 0,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "sourceId": "stevenxzhou/frameworks/chromeExtension/1point3acres/qa.js",
+      "unrecognizedMarkdownBlocks": 0,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "sourceId": "beak2825/greasyfork_archives/js_greasyfork/387976.js",
+      "unrecognizedMarkdownBlocks": 0,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "sourceId": "mageLi/1Point3Acres_Daily_Question/README.md",
+      "unrecognizedMarkdownBlocks": 0,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "sourceId": "leowang396/1point3acres-daily-question-solutions/README.md",
+      "unrecognizedMarkdownBlocks": 0,
+      "status": "ok",
+      "error": null
+    }
+  ],
+  "conflicts": [
+    {
+      "id": "q_d69e1c2683adb8cd",
+      "question": "在下面哪些板块里留微信号等各种联系方式，事后可以要求版主删除？",
+      "answers": [
+        "D. 绝大多数板块禁止留微信、拉群，如果你非要发出来，那就永远不删。另外，私下联系建议发站内信。",
+        "绝大多数板块禁止留微信、拉群，如果你非要发出来，那就永远不删。如果需要私聊，建议发站内信。"
+      ],
+      "sourceIds": [
+        "beak2825/greasyfork_archives/js_greasyfork/387976.js",
+        "eagleoflqj/p1a3_script/QA.js",
+        "leowang396/1point3acres-daily-question-solutions/README.md",
+        "mageLi/1Point3Acres_Daily_Question/README.md",
+        "stevenxzhou/frameworks/chromeExtension/1point3acres/qa.js",
+        "timerring/CloudCheckin/onepoint3acres/questions.py",
+        "zxc2012/1p3a_signin/src/questions.py"
+      ]
+    },
+    {
+      "id": "q_46cc52e4de6b14d4",
+      "question": "在国内可以访问一亩三分地吗？",
+      "answers": [
+        "可以",
+        "可以使用 留学网 https://instant.1point3acres.cn/ 和 Offer多多 https://offer.1point3acres.cn/"
+      ],
+      "sourceIds": [
+        "beak2825/greasyfork_archives/js_greasyfork/387976.js",
+        "eagleoflqj/p1a3_script/QA.js",
+        "stevenxzhou/frameworks/chromeExtension/1point3acres/qa.js",
+        "timerring/CloudCheckin/onepoint3acres/questions.py",
+        "zxc2012/1p3a_signin/src/questions.py"
+      ]
+    },
+    {
+      "id": "q_27eb3744f4d6a377",
+      "question": "普通用户参与维护社区文明秩序的方法有哪些",
+      "answers": [
+        "以上都是",
+        "点楼层内”举报“"
+      ],
+      "sourceIds": [
+        "beak2825/greasyfork_archives/js_greasyfork/387976.js",
+        "eagleoflqj/p1a3_script/QA.js",
+        "stevenxzhou/frameworks/chromeExtension/1point3acres/qa.js",
+        "timerring/CloudCheckin/onepoint3acres/questions.py",
+        "zxc2012/1p3a_signin/src/questions.py"
+      ]
+    },
+    {
+      "id": "q_92915973c633444c",
+      "question": "遇到不文明言论，如何合理应对？",
+      "answers": [
+        "这些违反论坛规则，被封号了怎么办？都是",
+        "这些都是"
+      ],
+      "sourceIds": [
+        "beak2825/greasyfork_archives/js_greasyfork/387976.js",
+        "eagleoflqj/p1a3_script/QA.js",
+        "stevenxzhou/frameworks/chromeExtension/1point3acres/qa.js",
+        "timerring/CloudCheckin/onepoint3acres/questions.py",
+        "zxc2012/1p3a_signin/src/questions.py"
+      ]
+    }
+  ],
+  "failed": []
+}
