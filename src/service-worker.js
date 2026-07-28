@@ -445,10 +445,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         await saveRuntimeState();
         if (success && pending.action === 'checkin') {
-          try { await chrome.notifications.create({ type: 'basic', iconUrl: 'assets/1point3acres-helper-icon-128.png', title: '一亩三分地每日助手', message: '签到完成' }); } catch {}
+          try { await chrome.notifications.create({ type: 'basic', iconUrl: 'assets/1point3acres-helper-icon-128.png', title: '一亩三分地每日助手', message: '签到完成', contextMessage: '每日任务已完成', priority: 2, requireInteraction: true }); } catch {}
         }
         if (success && pending.action === 'question' && pending.workflowId) {
-          try { await chrome.notifications.create({ type: 'basic', iconUrl: 'assets/1point3acres-helper-icon-128.png', title: '一亩三分地每日助手', message: '签到和答题完成' }); } catch {}
+          try { await chrome.notifications.create({ type: 'basic', iconUrl: 'assets/1point3acres-helper-icon-128.png', title: '一亩三分地每日助手', message: '签到和答题完成', contextMessage: '每日任务已完成', priority: 2, requireInteraction: true }); } catch {}
         }
         reply({ ok: true });
         if (success) {

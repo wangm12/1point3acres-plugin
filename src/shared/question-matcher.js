@@ -11,8 +11,11 @@
     if (!entry) return { status: 'unmatched', reason: 'not-in-bank' };
     const candidates = [...new Set((entry.answers || []).map(normalize).filter(Boolean))];
     const unique = [...new Set(candidates.flatMap((answer) => visible.reduce((out, option, index) => { if (normalize(option) === answer) out.push(index); return out; }, [])))];
-    if (unique.length === 1 && candidates.length === 1) return { status: 'matched', optionIndex: unique[0], answerText: visible[unique[0]], entryId: entry.id };
-    if (unique.length > 1 || candidates.length > 1) return { status: 'ambiguous', candidates: entry.answers || [], entryId: entry.id };
+    // A merged bank entry may contain different answers for the same question.
+    // The live option list is the disambiguation signal: one visible candidate
+    // is safe to match, while multiple visible candidates still require review.
+    if (unique.length === 1) return { status: 'matched', optionIndex: unique[0], answerText: visible[unique[0]], entryId: entry.id };
+    if (unique.length > 1) return { status: 'ambiguous', candidates: entry.answers || [], entryId: entry.id };
     return { status: 'unmatched', reason: 'answer-not-visible', entryId: entry.id };
   }
   global.QuestionMatcher = Object.freeze({ normalize, lookup });

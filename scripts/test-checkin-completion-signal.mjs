@@ -134,6 +134,7 @@ const buildCheckinHarness = () => {
   let defaultClicks = 0;
   let submitClicks = 0;
   let checkinStateOverride = null;
+  let submitReady = true;
 
   const body = makeElement('body');
   const main = makeElement('main');
@@ -142,6 +143,8 @@ const buildCheckinHarness = () => {
   const defaultMood = makeElement('button', '没心情');
   defaultMood.click = () => {
     defaultClicks += 1;
+    submitReady = false;
+    queueMicrotask(() => { submitReady = true; });
   };
   const submit = makeElement('button', '提交签到');
   submit.click = () => {
@@ -225,14 +228,13 @@ const buildCheckinHarness = () => {
       TOOLBAR_ID: 'p3a-daily-checkin-helper',
       isCheckinPage: () => true,
       findDefault: () => defaultMood,
-      findSubmit: () => submit,
+      findSubmit: () => submitReady ? submit : null,
       getState: () => {
         if (checkinStateOverride) return checkinStateOverride;
         return /今日已签到|已经签到|今日签到已完成|already checked.?in|already signed/i.test(String(body.innerText || body.textContent || ''))
           ? 'completed'
           : 'active';
       },
-      nodeSignature: (node) => String(node?.textContent || ''),
     },
     CheckinState: {
       reconcile: (prepared, href, current) => {
@@ -277,6 +279,9 @@ const buildCheckinHarness = () => {
     },
     get actionResults() {
       return actionResults;
+    },
+    get toastText() {
+      return document.getElementById('p3a-checkin-complete-toast')?.textContent || '';
     },
     setCheckinState(nextState) {
       checkinStateOverride = nextState;
@@ -439,6 +444,9 @@ const buildQuestionHarness = ({ completionText }) => {
     get submitClicks() {
       return submitClicks;
     },
+    get toastText() {
+      return document.getElementById('p3a-checkin-complete-toast')?.textContent || '';
+    },
     setQuestionState(nextState) {
       questionState = nextState;
     },
@@ -460,6 +468,7 @@ assertRemoteAccepted(checkinResponse, 'dynamic completion check-in command must 
 await waitFor(() => checkinHarness.actionResultCalls === 1, { timeoutMs: 1200, message: 'check-in ACTION_RESULT must be reported once' });
 assert.equal(checkinHarness.defaultClicks, 1, 'remote check-in should click the default mood exactly once');
 assert.equal(checkinHarness.submitClicks, 1, 'remote check-in should click the native submit exactly once');
+assert.equal(checkinHarness.toastText, '签到完成', 'check-in completion should show a page toast');
 assert.deepEqual(toPlain(checkinHarness.actionResults), [{
   actionId: 'checkin-done-1',
   action: 'checkin',
@@ -477,7 +486,7 @@ const questionSuccessHarness = buildQuestionHarness({ completionText: '答题成
 assert.equal(typeof questionSuccessHarness.runtimeListener, 'function', 'content script must register a runtime listener for question success');
 const questionSuccessResponse = await new Promise((resolve) => {
   questionSuccessHarness.runtimeListener(
-    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'question-done-1' } },
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'question-done-1', workflowId: 'workflow-done-1' } },
     {},
     resolve,
   );
@@ -485,6 +494,7 @@ const questionSuccessResponse = await new Promise((resolve) => {
 assertRemoteAccepted(questionSuccessResponse, 'question completion-text command must be accepted');
 await waitFor(() => questionSuccessHarness.actionResultCalls === 1, { timeoutMs: 1200, message: 'question success text should report ACTION_RESULT once' });
 assert.equal(questionSuccessHarness.submitClicks, 1, 'question should click submit exactly once before completion text');
+assert.equal(questionSuccessHarness.toastText, '签到和答题完成', 'completed workflow should show the combined page toast');
 assert.deepEqual(toPlain(questionSuccessHarness.actionResults), [{
   actionId: 'question-done-1',
   action: 'question',
@@ -506,6 +516,7 @@ const questionDoneResponse = await new Promise((resolve) => {
 assertRemoteAccepted(questionDoneResponse, 'already-done question command must be accepted');
 await waitFor(() => questionDoneHarness.actionResultCalls === 1, { timeoutMs: 1200, message: '今日已答题 should report ACTION_RESULT once' });
 assert.equal(questionDoneHarness.submitClicks, 1, 'question should not need a second submit to observe 今日已答题');
+assert.equal(questionDoneHarness.toastText, '答题完成', 'standalone question completion should show an answer toast');
 assert.deepEqual(toPlain(questionDoneHarness.actionResults), [{
   actionId: 'question-done-2',
   action: 'question',

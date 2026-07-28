@@ -38,7 +38,7 @@ assert.match(content, /const REMOTE_ACTION_RETRY_MS = 200/);
 assert.match(content, /Date\.now\(\) - started >= REMOTE_RESULT_TIMEOUT_MS/);
 assert.match(content, /pendingRemoteActions\.has\(actionId\)/);
 assert.match(content, /const runQuestionAction = async/);
-assert.match(content, /if \(action === 'question'\) \{\s*runQuestionAction\(\{ actionId \}\)\.catch\(\(\) => \{\}\);\s*\}/, 'remote question command must call the direct execution path');
+assert.match(content, /if \(action === 'question'\) \{\s*runQuestionAction\(\{ actionId, workflowId \}\)\.catch\(\(\) => \{\}\);\s*\}/, 'remote question command must call the direct execution path');
 assert.doesNotMatch(content, /runToolbarAction\(action, actionId\)/, 'question remote path must not depend on toolbar clicks');
 const handler = content.slice(content.indexOf('chrome.runtime.onMessage.addListener'), content.indexOf('let prepared = null'));
 assert.match(handler, /pendingRemoteActions\.add\(actionId\)/);

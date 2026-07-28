@@ -36,16 +36,16 @@ const toolbarId = 'p3a-daily-question-helper';
 const checkinToolbarId = DailyCheckinPage.TOOLBAR_ID;
 const checkinToastId = 'p3a-checkin-complete-toast';
 let checkinToastTimer = null;
-const showCheckinToast = () => {
+const showCheckinToast = (message = '签到完成') => {
   let toast = document.getElementById(checkinToastId);
   if (!toast) {
     toast = document.createElement('div');
     toast.id = checkinToastId;
     toast.setAttribute('role', 'status');
     toast.setAttribute('aria-live', 'polite');
-    toast.textContent = '签到完成';
     document.body.appendChild(toast);
   }
+  toast.textContent = message;
   clearTimeout(checkinToastTimer);
   checkinToastTimer = setTimeout(() => { toast.remove(); }, 3000);
 };
@@ -56,6 +56,7 @@ const isQuestionPage = () => DailyQuestionPage.isQuestionPage(location.href);
 const pendingRemoteActions = new Set();
 const remoteActionTimers = new Map();
 const remoteActionResults = new Map();
+const remoteActionToastMessages = new Map();
 const REMOTE_ACTION_TIMEOUT_MS = 8000;
 const REMOTE_ACTION_RETRY_MS = 200;
 let activeRemoteActionId = null;
@@ -64,6 +65,8 @@ const REMOTE_RESULT_REPORT_MAX_RETRIES = 5;
 const REMOTE_RESULT_REPORT_DELAY_MS = 200;
 const QUESTION_SUBMIT_WAIT_MS = 4000;
 const QUESTION_SUBMIT_POLL_MS = 100;
+const CHECKIN_SUBMIT_WAIT_MS = 2000;
+const CHECKIN_SUBMIT_POLL_MS = 100;
 let questionStatusNode = null;
 let checkinStatusNode = null;
 const cleanTextValue = (value) => String(value?.textContent ?? value ?? '').replace(/\s+/g, ' ').trim();
@@ -109,16 +112,18 @@ const reportRemoteResult = async (actionId, action, status, reason) => {
   }
 };
 const finishRemoteAction = (actionId, action, status, reason) => {
+  const toastMessage = remoteActionToastMessages.get(actionId) || (action === 'question' ? '答题完成' : '签到完成');
   if (!actionId) {
     activeRemoteActionId = null;
-    if (action === 'checkin' && status === 'success') showCheckinToast();
+    if (status === 'success') showCheckinToast(toastMessage);
     return;
   }
   remoteActionResults.set(actionId, { action, status, reason, delivered: false });
   remoteActionTimers.delete(actionId);
   pendingRemoteActions.delete(actionId);
   if (activeRemoteActionId === actionId) activeRemoteActionId = null;
-  if (action === 'checkin' && status === 'success') showCheckinToast();
+  if (status === 'success') showCheckinToast(toastMessage);
+  remoteActionToastMessages.delete(actionId);
   reportRemoteResult(actionId, action, status, reason).catch(() => {});
 };
 const waitForRemoteResult = (action, actionId, status) => new Promise((resolve) => {
@@ -158,6 +163,15 @@ const waitForQuestionSubmit = async (questionKey, optionTexts, answerText) => {
   }
   return { ok: false, reason: 'submit-timeout' };
 };
+const waitForCheckinSubmit = async () => {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < CHECKIN_SUBMIT_WAIT_MS) {
+    const submit = DailyCheckinPage.findSubmit();
+    if (submit && !submit.disabled && submit.isConnected !== false) return submit;
+    await new Promise((resolve) => setTimeout(resolve, CHECKIN_SUBMIT_POLL_MS));
+  }
+  return null;
+};
 const waitForStableQuestionSnapshot = async (startedAt) => {
   let lastSignature = '';
   let stableCount = 0;
@@ -192,10 +206,11 @@ const waitForStableQuestionSnapshot = async (startedAt) => {
   }
   return { ok: false, reason: 'question-not-ready' };
 };
-const runQuestionAction = async ({ actionId = null } = {}) => {
+const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) => {
   if (actionId) {
     pendingRemoteActions.add(actionId);
     activeRemoteActionId = actionId;
+    remoteActionToastMessages.set(actionId, workflowId ? '签到和答题完成' : '答题完成');
   }
   const status = questionStatusNode || { textContent: '' };
   const failRemote = actionId ? (reason) => finishRemoteAction(actionId, 'question', 'failed', reason) : () => {};
@@ -204,7 +219,7 @@ const runQuestionAction = async ({ actionId = null } = {}) => {
     while (Date.now() - startedAt < REMOTE_ACTION_TIMEOUT_MS) {
       const snapshot = await waitForStableQuestionSnapshot(startedAt);
       if (!snapshot.ok) { failRemote(snapshot.reason); status.textContent = snapshot.reason === 'requires-login' ? '需登录：不能一键答题' : '题目或选项已变化，未提交'; return; }
-      if (snapshot.completed) { if (actionId) finishRemoteAction(actionId, 'question', 'success', 'already-completed'); status.textContent = '已完成：今日已答题'; return; }
+      if (snapshot.completed) { finishRemoteAction(actionId, 'question', 'success', 'already-completed'); status.textContent = '已完成：今日已答题'; return; }
       const lookupResponse = await bridge.send(ExtensionProtocol.MESSAGE_TYPES.LOOKUP_QUESTION, { question: snapshot.question, options: snapshot.optionTexts }).catch(() => null);
       const result = lookupResponse?.payload;
       if (!result) {
@@ -260,7 +275,7 @@ const runQuestionAction = async ({ actionId = null } = {}) => {
       clickVisibleQuestionSubmit(siteSubmit);
       answerActionKey = actionKey;
       status.textContent = '已触发官网提交，等待结果（如有验证码请完成）';
-      if (actionId) await waitForRemoteResult('question', actionId, status);
+      await waitForRemoteResult('question', actionId, status);
       return;
     }
     failRemote('question-not-ready');
@@ -282,18 +297,20 @@ const runCheckinAction = async ({ actionId = null } = {}) => {
   try {
     const currentState = DailyCheckinPage.getState();
     if (currentState === 'requires-login') { failRemote('requires-login'); status.textContent = '需登录：不能一键签到'; return; }
-    if (currentState === 'completed') { if (actionId) finishRemoteAction(actionId, 'checkin', 'success', 'already-completed'); status.textContent = '已完成：今日已签到'; return; }
+    if (currentState === 'completed') { finishRemoteAction(actionId, 'checkin', 'success', 'already-completed'); status.textContent = '已完成：今日已签到'; return; }
     const current = DailyCheckinPage.findDefault();
-    const submit = DailyCheckinPage.findSubmit();
-    if (!current || !submit) { failRemote('submit-not-found'); status.textContent = '未找到站点签到按钮，未提交'; return; }
-    current.click();
-    const key = `${location.href}:${DailyCheckinPage.nodeSignature(current)}:${DailyCheckinPage.nodeSignature(submit)}`;
+    if (!current) { failRemote('default-option-not-found'); status.textContent = '未找到“没心情”默认选项，未提交'; return; }
+    const key = `${location.href}:${CheckinState.nodeSignature(current)}`;
     if (checkinActionKey === key) { failRemote('duplicate-action'); status.textContent = '已一键签到，等待站点结果'; return; }
+    current.click();
+    // Selecting a mood can cause the site to re-render the submit button.
+    // Always resolve the live site-owned button after the selection event.
+    const submit = await waitForCheckinSubmit();
+    if (!submit) { failRemote('submit-not-found'); status.textContent = '未找到站点签到按钮，未提交'; return; }
     checkinActionKey = key;
     submit.click();
     status.textContent = '已触发官网提交，等待结果（如有验证码请完成）';
-    if (actionId) await waitForRemoteResult('checkin', actionId, status);
-    else showCheckinToast();
+    await waitForRemoteResult('checkin', actionId, status);
   } catch {
     checkinActionKey = null;
     failRemote('action-failed');
@@ -304,6 +321,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type !== ExtensionProtocol.MESSAGE_TYPES.RUN_ONE_CLICK) return false;
   const action = message.payload?.action;
   const actionId = message.payload?.actionId ?? message.payload?.workflowId ?? null;
+  const workflowId = message.payload?.workflowId ?? null;
   const accept = (extra = {}) => {
     sendResponse({ ok: true, accepted: true, actionId, ...extra });
     return true;
@@ -324,7 +342,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   pendingRemoteActions.add(actionId);
   remoteActionTimers.delete(actionId);
   if (action === 'question') {
-    runQuestionAction({ actionId }).catch(() => {});
+    runQuestionAction({ actionId, workflowId }).catch(() => {});
   } else {
     runCheckinAction({ actionId }).catch(() => {});
   }
@@ -451,7 +469,7 @@ const renderCheckin = () => {
     const remoteActionId = activeRemoteActionId;
     activeRemoteActionId = null;
     const current = DailyCheckinPage.findDefault();
-    const submit = DailyCheckinPage.findSubmit();
+    const submit = await waitForCheckinSubmit();
     const reconciled = CheckinState.reconcile(checkinPrepared, location.href, current);
     if (!reconciled || !submit) { checkinPrepared = null; confirm.disabled = true; status.textContent = '签到页面或控件已变化，请重新准备'; return; }
     checkinPrepared = reconciled;
@@ -473,7 +491,7 @@ const renderCheckin = () => {
     if (key === checkinActionKey) { failRemote('duplicate-action'); status.textContent = '一键签到已执行，等待站点结果'; return; }
     try {
       if (!CheckinState.reconcile(checkinPrepared, location.href, current)) { current.click(); checkinPrepared = CheckinState.prepare(current, location.href); }
-      const submit = DailyCheckinPage.findSubmit();
+      const submit = await waitForCheckinSubmit();
       if (!submit) { failRemote('submit-not-found'); status.textContent = '未找到站点签到按钮，未提交'; return; }
       submit.click(); checkinActionKey = key; checkinPrepared = null; status.textContent = '已提交，等待签到结果（如有验证码请完成）';
       await waitForRemoteResult('checkin', remoteActionId, status);

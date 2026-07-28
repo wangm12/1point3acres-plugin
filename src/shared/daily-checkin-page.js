@@ -6,7 +6,7 @@
   const DEFAULT = /只想签到拿米|只想签到|qdxq\s*[:=]?\s*x/i;
   const DEFAULT_MOOD = /没心情/;
   const BAD = /导航|搜索|登录|注册|我的版块|返回|首页|签到记录|已签到|提交答案|取消|menu|login|sign.?up|back|search|submit|cancel/i;
-  const text = (n) => String(n?.textContent || '').replace(/\s+/g, ' ').trim();
+  const text = (n) => String(n?.textContent || n?.value || n?.getAttribute?.('value') || n?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
   const visible = (n) => Boolean(n && !n.hidden && n.getAttribute?.('aria-hidden') !== 'true' && (n.offsetParent !== null || n.ownerDocument?.defaultView == null));
   const inToolbar = (n) => Boolean(n?.closest?.(`#${TOOLBAR_ID}`));
   const isCheckinPage = (url = global.location?.href || '') => /\/next\/daily-checkin\/?(?:[?#].*)?$/.test(url);
@@ -24,7 +24,7 @@
   }
   function findSubmit(root = global.document) {
     const ACTION = /^(?:签到|立即签到|确认签到|提交签到|check\s*in|sign\s*in)$/i;
-    return Array.from(root.querySelectorAll?.('button,[role="button"]') || []).find((n) => {
+    return Array.from(root.querySelectorAll?.('button,input[type="submit"],input[type="button"],[role="button"]') || []).find((n) => {
       const label = text(n).replace(/[：:!！。.]$/g, '').trim();
       return visible(n) && !inToolbar(n) && !n.disabled && ACTION.test(label);
     }) || null;

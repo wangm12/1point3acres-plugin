@@ -12,6 +12,9 @@ const entries = [
 ];
 assert(lookup('Which answer？', ['Beta', 'A. Alpha'], entries).optionIndex === 1, 'unique match or prefix failed');
 assert(lookup('Which answer？', ['A. Alpha', 'Beta'], entries).optionIndex === 0, 'option order failed');
+assert(lookup('Many?', ['答案A', '其他答案'], [{ id: 'visible-one', question: 'Many?', aliases: [], answers: ['答案A', '答案B'] }]).optionIndex === 0, 'unique visible answer should disambiguate bank answers');
+assert(lookup('Many?', ['答案A', '答案B'], [{ id: 'visible-many', question: 'Many?', aliases: [], answers: ['答案A', '答案B'] }]).status === 'ambiguous', 'multiple visible answers must remain ambiguous');
+assert(lookup('Many?', ['其他答案'], [{ id: 'visible-none', question: 'Many?', aliases: [], answers: ['答案A', '答案B'] }]).status === 'unmatched', 'invisible bank answers should remain unmatched');
 assert(lookup('Many?', ['One', 'Two'], entries).status === 'ambiguous', 'ambiguous failed');
 assert(lookup('Unknown?', ['One'], entries).status === 'unmatched', 'unmatched failed');
 assert(normalize(' A.  Alpha ') === normalize('alpha'), 'A./B. normalization failed');

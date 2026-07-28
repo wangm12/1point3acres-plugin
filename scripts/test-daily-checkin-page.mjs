@@ -25,6 +25,7 @@ x = make('<button>每日签到</button><button>签到记录</button><button>签�
 assert.equal(x.api.findSubmit(x.document), null);
 x = make('<button>确认签到</button>'); assert(x.api.findSubmit(x.document));
 x = make('<button>提交签到</button>'); assert(x.api.findSubmit(x.document));
+x = make('<input type="submit" value="提交签到"></input>'); assert(x.api.findSubmit(x.document));
 x = make('<button>请先登录</button>'); assert.equal(x.api.getState(x.document), 'requires-login');
 x = make('<div>今日已签到</div>'); assert.equal(x.api.getState(x.document), 'completed');
 x = make('<button>心情很好</button><textarea></textarea>'); assert.equal(x.api.findDefault(x.document), null);
