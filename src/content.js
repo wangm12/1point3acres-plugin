@@ -58,6 +58,7 @@ const remoteActionTimers = new Map();
 const remoteActionResults = new Map();
 const remoteActionToastMessages = new Map();
 const REMOTE_ACTION_TIMEOUT_MS = 8000;
+const QUESTION_READY_TIMEOUT_MS = 3000;
 const REMOTE_ACTION_RETRY_MS = 200;
 let activeRemoteActionId = null;
 const REMOTE_RESULT_TIMEOUT_MS = 12000;
@@ -172,11 +173,11 @@ const waitForCheckinSubmit = async () => {
   }
   return null;
 };
-const waitForStableQuestionSnapshot = async (startedAt) => {
+const waitForStableQuestionSnapshot = async (startedAt, deadlineMs = REMOTE_ACTION_TIMEOUT_MS) => {
   let lastSignature = '';
   let stableCount = 0;
   let initialReadySignature = null;
-  while (Date.now() - startedAt < REMOTE_ACTION_TIMEOUT_MS) {
+  while (Date.now() - startedAt < deadlineMs) {
     const state = DailyQuestionPage.getState();
     const questionResult = DailyQuestionPage.findQuestion();
     const question = normalizeQuestion(questionResult.value);
@@ -216,9 +217,18 @@ const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) =>
   const failRemote = actionId ? (reason) => finishRemoteAction(actionId, 'question', 'failed', reason) : () => {};
   try {
     const startedAt = Date.now();
+    const questionReadyTimeoutMs = actionId ? QUESTION_READY_TIMEOUT_MS : REMOTE_ACTION_TIMEOUT_MS;
     while (Date.now() - startedAt < REMOTE_ACTION_TIMEOUT_MS) {
-      const snapshot = await waitForStableQuestionSnapshot(startedAt);
-      if (!snapshot.ok) { failRemote(snapshot.reason); status.textContent = snapshot.reason === 'requires-login' ? '需登录：不能一键答题' : '题目或选项已变化，未提交'; return; }
+      const snapshot = await waitForStableQuestionSnapshot(startedAt, questionReadyTimeoutMs);
+      if (!snapshot.ok) {
+        failRemote(snapshot.reason);
+        status.textContent = snapshot.reason === 'requires-login'
+          ? '需登录：不能一键答题'
+          : snapshot.reason === 'question-not-ready'
+            ? '题目或选项未稳定，未提交'
+            : '题目或选项已变化，未提交';
+        return;
+      }
       if (snapshot.completed) { finishRemoteAction(actionId, 'question', 'success', 'already-completed'); status.textContent = '已完成：今日已答题'; return; }
       const lookupResponse = await bridge.send(ExtensionProtocol.MESSAGE_TYPES.LOOKUP_QUESTION, { question: snapshot.question, options: snapshot.optionTexts }).catch(() => null);
       const result = lookupResponse?.payload;

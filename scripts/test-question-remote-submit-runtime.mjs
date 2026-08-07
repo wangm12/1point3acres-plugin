@@ -6,6 +6,7 @@ import vm from 'node:vm';
 const source = fs
   .readFileSync(new URL('../src/content.js', import.meta.url), 'utf8')
   .replace('const REMOTE_ACTION_TIMEOUT_MS = 8000;', 'const REMOTE_ACTION_TIMEOUT_MS = 80;')
+  .replace('const QUESTION_READY_TIMEOUT_MS = 3000;', 'const QUESTION_READY_TIMEOUT_MS = 30;')
   .replace('const REMOTE_ACTION_RETRY_MS = 200;', 'const REMOTE_ACTION_RETRY_MS = 1;')
   .replace('const REMOTE_RESULT_TIMEOUT_MS = 12000;', 'const REMOTE_RESULT_TIMEOUT_MS = 50;')
   .replace('const QUESTION_SUBMIT_WAIT_MS = 4000;', 'const QUESTION_SUBMIT_WAIT_MS = 50;')
@@ -122,6 +123,7 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity } = {
   let toolbarClicks = 0;
   let lookupCallCount = 0;
   const lookupTimeline = [];
+  const actionResults = [];
   let renderLookupRequestedAt = null;
   let renderLookupResolvedAt = null;
   let submitClickedAt = null;
@@ -210,6 +212,7 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity } = {
         }
 
         if (message.type === 'CONTENT_READY' || message.type === 'SAVE_LEARNED_ANSWER' || message.type === 'ACTION_RESULT') {
+          if (message.type === 'ACTION_RESULT') actionResults.push(message.payload);
           return respond({ ok: true });
         }
 
@@ -315,6 +318,9 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity } = {
     get runtimeListenerFn() {
       return runtimeListener;
     },
+    get actionResults() {
+      return actionResults;
+    },
   };
 };
 
@@ -364,9 +370,30 @@ const guardResponse = new Promise((resolve) => {
   );
 });
 await guardResponse.then((response) => assertResponse(response, 'guarded remote command must be accepted'));
-await delay(200);
+await waitFor(() => guard.actionResults.length >= 1, { message: 'changed question must report a failed ACTION_RESULT' });
 assert.equal(guard.submitClicks, 0, 'changed question must not submit');
+assert.equal(guard.actionResults[0]?.actionId, 'remote-2', 'changed question should keep the original action id');
+assert.equal(guard.actionResults[0]?.action, 'question', 'changed question should report the question action');
+assert.equal(guard.actionResults[0]?.status, 'failed', 'changed question should report failure');
+assert.equal(guard.actionResults[0]?.reason, 'question-changed-or-unavailable', 'changed question should stop auto submit and leave the tab for the user');
 assert.equal(primary.submitClicks, 1, 'first remote submit must remain the only submit click');
+
+const notReady = buildQuestionHarness({ questionText: '', changedAfterReads: Infinity });
+await waitFor(() => notReady.runtimeListenerFn, { message: 'not-ready harness should register a runtime listener' });
+const notReadyResponse = new Promise((resolve) => {
+  notReady.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'remote-3' } },
+    {},
+    (response) => resolve(response),
+  );
+});
+await notReadyResponse.then((response) => assertResponse(response, 'not-ready remote command must be accepted'));
+await waitFor(() => notReady.actionResults.length >= 1, { message: 'not-ready question must report a failed ACTION_RESULT' });
+assert.equal(notReady.submitClicks, 0, 'question not ready within the 3-second window must not submit');
+assert.equal(notReady.actionResults[0]?.actionId, 'remote-3', 'question not ready should keep the original action id');
+assert.equal(notReady.actionResults[0]?.action, 'question', 'question not ready should report the question action');
+assert.equal(notReady.actionResults[0]?.status, 'failed', 'question not ready should report failure');
+assert.equal(notReady.actionResults[0]?.reason, 'question-not-ready', 'question not ready within the 3-second window should fail without submitting');
 
 const noCallbackHarness = buildQuestionHarness({ questionText: '一亩三分地里有哪些方面的干货信息？', changedAfterReads: Infinity });
 const noCallbackResult = noCallbackHarness.chrome.runtime.sendMessage({ type: 'CONTENT_READY' });

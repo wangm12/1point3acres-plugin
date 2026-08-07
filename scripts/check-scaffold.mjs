@@ -57,6 +57,8 @@ assert(contentScripts.length === 1, 'expected one content_scripts entry');
 
 const script = contentScripts[0];
 const expectedMatches = [
+  'https://1point3acres.com/next/daily-question*',
+  'https://1point3acres.com/next/daily-checkin*',
   'https://www.1point3acres.com/next/daily-question*',
   'https://www.1point3acres.com/next/daily-checkin*',
 ];
@@ -101,5 +103,12 @@ assert(
 assert(protocol.PAGE_URLS?.dailyQuestion === 'https://www.1point3acres.com/next/daily-question', 'dailyQuestion navigation URL mismatch');
 assert(protocol.PAGE_URLS?.dailyCheckin === 'https://www.1point3acres.com/next/daily-checkin', 'dailyCheckin navigation URL mismatch');
 assert(!Object.values(protocol.PAGE_URLS).some((url) => url.endsWith('*')), 'navigation URLs must not contain match wildcard');
+
+const contentSource = readText('src/content.js');
+assert(contentSource.includes("document.getElementById(toolbarId)") && contentSource.includes("if (!bar) { bar = document.createElement('section');"), 'daily question toolbar must render from the content script');
+assert(contentSource.includes("document.getElementById(checkinToolbarId)") && contentSource.includes("if (!bar) { bar = document.createElement('section');"), 'daily check-in toolbar must render from the content script');
+assert(contentSource.includes("select.textContent = '选中答案'"), 'manual select-answer button missing');
+assert(contentSource.includes("remember.textContent = '记住当前答案'"), 'remember-answer button missing');
+assert(contentSource.includes("submit.textContent = '确认并提交'"), 'manual submit button missing');
 
 console.log('Scaffold checks passed.');

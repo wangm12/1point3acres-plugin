@@ -14,6 +14,8 @@
   });
 
   const PAGE_MATCHES = Object.freeze([
+    'https://1point3acres.com/next/daily-question*',
+    'https://1point3acres.com/next/daily-checkin*',
     'https://www.1point3acres.com/next/daily-question*',
     'https://www.1point3acres.com/next/daily-checkin*',
   ]);

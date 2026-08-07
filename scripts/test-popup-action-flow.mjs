@@ -34,7 +34,9 @@ assert.match(content, /REMOTE_RESULT_TIMEOUT_MS = 12000/);
 assert.match(content, /waitForRemoteResult/);
 
 assert.match(content, /const REMOTE_ACTION_TIMEOUT_MS = 8000/);
+assert.match(content, /const QUESTION_READY_TIMEOUT_MS = 3000/);
 assert.match(content, /const REMOTE_ACTION_RETRY_MS = 200/);
+assert.match(content, /const questionReadyTimeoutMs = actionId \? QUESTION_READY_TIMEOUT_MS : REMOTE_ACTION_TIMEOUT_MS/);
 assert.match(content, /Date\.now\(\) - started >= REMOTE_RESULT_TIMEOUT_MS/);
 assert.match(content, /pendingRemoteActions\.has\(actionId\)/);
 assert.match(content, /const runQuestionAction = async/);

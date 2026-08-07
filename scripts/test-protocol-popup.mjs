@@ -10,6 +10,8 @@ vm.runInNewContext(protocolSource, sandbox);
 const protocol = sandbox.globalThis.ExtensionProtocol;
 
 assert.deepEqual(Array.from(protocol.PAGE_MATCHES), [
+  'https://1point3acres.com/next/daily-question*',
+  'https://1point3acres.com/next/daily-checkin*',
   'https://www.1point3acres.com/next/daily-question*',
   'https://www.1point3acres.com/next/daily-checkin*',
 ]);

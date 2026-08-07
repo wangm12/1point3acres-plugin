@@ -11,6 +11,7 @@ assert.match(question, /DailyQuestionPage\.getState\(\)/);
 assert.match(source, /const runQuestionAction = async/);
 const answerAction = source.slice(source.indexOf('const runQuestionAction'), source.indexOf('chrome.runtime.onMessage.addListener'));
 assert.match(answerAction, /waitForStableQuestionSnapshot/);
+assert.match(answerAction, /const questionReadyTimeoutMs = actionId \? QUESTION_READY_TIMEOUT_MS : REMOTE_ACTION_TIMEOUT_MS/);
 assert.match(answerAction, /const lookupResponse = await bridge\.send\(ExtensionProtocol\.MESSAGE_TYPES\.LOOKUP_QUESTION/);
 assert.match(answerAction, /const actionKey = `\$\{snapshot\.question\}:\$\{lookupAnswerText\}`/);
 assert.match(answerAction, /if \(actionKey === answerActionKey\) \{ failRemote\('duplicate-action'\); status\.textContent = '已一键答题，等待站点结果'; return; \}/);
