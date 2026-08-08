@@ -21,6 +21,26 @@
 
 扩展图标使用一亩三分地 favicon 的本地派生图，并叠加红色斜杠/断裂标记；图标文件位于 `assets/`，由 scaffold 检查确认 16/32/48/128 四种尺寸均存在。
 
+## 界面示例
+
+1. 答题
+
+   ![答题界面截图](docs/screenshots/answer.png)
+
+   题目页面的答题辅助界面。
+
+2. 签到
+
+   ![签到界面截图](docs/screenshots/checkin.png)
+
+   签到页面的辅助操作界面。
+
+3. 一键答题签到
+
+   ![一键答题签到界面截图](docs/screenshots/everything.png)
+
+   一键串联签到和答题的流程界面。
+
 ## 使用流程
 
 - popup 只有一个按钮：“一键签到&打卡”。
