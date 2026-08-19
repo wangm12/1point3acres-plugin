@@ -143,7 +143,32 @@ const AUTO_RECOVERABLE_REASONS = new Set([
   'question-changed-or-unavailable',
 ]);
 
-const defaultRuntimeState = () => ({
+const DAILY_STATUS_STORAGE_KEY = 'p3a-daily-status-v1';
+
+const getInitialDailyStatus = (dateKey = getLosAngelesDateKey()) => ({
+  dateKey,
+  checkin: { completed: false, at: null },
+  question: { completed: false, at: null },
+});
+
+const normalizeDailyStatus = (daily, todayKey = getLosAngelesDateKey()) => {
+  if (!daily || typeof daily !== 'object' || daily.dateKey !== todayKey) {
+    return getInitialDailyStatus(todayKey);
+  }
+  return {
+    dateKey: todayKey,
+    checkin: {
+      completed: daily.checkin?.completed === true,
+      at: Number.isFinite(daily.checkin?.at) ? daily.checkin.at : null,
+    },
+    question: {
+      completed: daily.question?.completed === true,
+      at: Number.isFinite(daily.question?.at) ? daily.question.at : null,
+    },
+  };
+};
+
+const defaultRuntimeState = (dateKey = getLosAngelesDateKey()) => ({
   version: 2,
   run: {
     runId: null,
@@ -163,6 +188,7 @@ const defaultRuntimeState = () => ({
   diagnostics: {
     legacy: { actionsByTabId: {}, workflowsById: {}, activeWorkflowId: null },
   },
+  dailyStatus: getInitialDailyStatus(dateKey),
   actionsByTabId: {},
   awaitingContentByTabId: {},
   pendingActionsById: {},
@@ -220,8 +246,10 @@ const normalizeWorkflow = (workflow) => {
 };
 
 const normalizeRuntimeState = (state) => {
-  const next = defaultRuntimeState();
+  const todayKey = getLosAngelesDateKey();
+  const next = defaultRuntimeState(todayKey);
   if (!state || typeof state !== 'object') return next;
+  next.dailyStatus = normalizeDailyStatus(state.dailyStatus, todayKey);
   if (state.run && typeof state.run === 'object') {
     const run = state.run;
     next.run = {
@@ -283,13 +311,51 @@ const normalizeRuntimeState = (state) => {
   return next;
 };
 
+const markDailyTaskCompleted = async (action, dateKey = getLosAngelesDateKey(), nowMs = Date.now()) => {
+  await loadRuntimeState();
+  if (!runtimeState.dailyStatus || runtimeState.dailyStatus.dateKey !== dateKey) {
+    runtimeState.dailyStatus = getInitialDailyStatus(dateKey);
+  }
+  if (action === 'checkin') {
+    runtimeState.dailyStatus.checkin = { completed: true, at: nowMs };
+  } else if (action === 'question') {
+    runtimeState.dailyStatus.question = { completed: true, at: nowMs };
+  }
+  await saveRuntimeState();
+  await chrome.storage.local.set({ [DAILY_STATUS_STORAGE_KEY]: runtimeState.dailyStatus }).catch(() => {});
+};
+
 const loadRuntimeState = async () => {
-  if (runtimeState) return runtimeState;
+  if (runtimeState) {
+    const todayKey = getLosAngelesDateKey();
+    if (!runtimeState.dailyStatus || runtimeState.dailyStatus.dateKey !== todayKey) {
+      const storedLocal = await chrome.storage.local.get(DAILY_STATUS_STORAGE_KEY).catch(() => ({}));
+      runtimeState.dailyStatus = normalizeDailyStatus(storedLocal?.[DAILY_STATUS_STORAGE_KEY], todayKey);
+    }
+    return runtimeState;
+  }
   if (!runtimePromise) {
-    runtimePromise = runtimeStorage.get(RUNTIME_STORAGE_KEY).then((stored) => {
+    runtimePromise = (async () => {
+      const stored = await runtimeStorage.get(RUNTIME_STORAGE_KEY).catch(() => ({}));
       runtimeState = normalizeRuntimeState(stored[RUNTIME_STORAGE_KEY]);
+      const todayKey = getLosAngelesDateKey();
+      if (!runtimeState.dailyStatus?.checkin?.completed || !runtimeState.dailyStatus?.question?.completed) {
+        const storedLocal = await chrome.storage.local.get(DAILY_STATUS_STORAGE_KEY).catch(() => ({}));
+        const localDaily = normalizeDailyStatus(storedLocal?.[DAILY_STATUS_STORAGE_KEY], todayKey);
+        runtimeState.dailyStatus = {
+          dateKey: todayKey,
+          checkin: {
+            completed: runtimeState.dailyStatus.checkin?.completed || localDaily.checkin?.completed || false,
+            at: runtimeState.dailyStatus.checkin?.at || localDaily.checkin?.at || null,
+          },
+          question: {
+            completed: runtimeState.dailyStatus.question?.completed || localDaily.question?.completed || false,
+            at: runtimeState.dailyStatus.question?.at || localDaily.question?.at || null,
+          },
+        };
+      }
       return runtimeState;
-    });
+    })();
   }
   return runtimePromise;
 };
@@ -318,15 +384,18 @@ const setRunError = async (error, type = 'error') => {
 const clearLegacyTaskState = async () => {
   await loadRuntimeState();
   const currentRun = runtimeState.run ? { ...runtimeState.run } : null;
+  const currentDaily = runtimeState.dailyStatus ? { ...runtimeState.dailyStatus } : null;
   runtimeState.actionsByTabId = {};
   runtimeState.awaitingContentByTabId = {};
   runtimeState.pendingActionsById = {};
   runtimeState.workflowsById = {};
   runtimeState.activeWorkflowId = null;
+  if (currentDaily) {
+    runtimeState.dailyStatus = currentDaily;
+  }
   if (currentRun?.runId) {
     runtimeState.run = { ...defaultRuntimeState().run, ...currentRun };
   }
-  await saveRuntimeState();
 };
 const cleanupNonActiveDailyTabs = async (activeTabId = null) => {
   const tabs = await chrome.tabs.query({}).catch(() => []);
@@ -1787,6 +1856,7 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
     runtimeState.run.stage = 'checkin';
     runtimeState.run.currentTabId = tabId;
     runtimeState.run.currentActionId = record.actionId;
+    await markDailyTaskCompleted('checkin');
     await saveRuntimeState();
     const finalizationScheduled = await scheduleRuntimeFinalization({ ...record, tabId, status: 'completed', lastResult: { ...result }, finalizationPending: true }).catch(() => false);
     if (autoRun) {
@@ -1799,6 +1869,7 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
   if (success && result?.action === 'question') {
     runtimeState.actionsByTabId[String(tabId)] = { ...record, status: 'completed', lastResult: { ...result }, finalizationPending: true };
     runtimeState.run.status = 'running';
+    await markDailyTaskCompleted('question');
     await saveRuntimeState();
     const finalizationScheduled = await scheduleRuntimeFinalization({ ...record, tabId, status: 'completed', lastResult: { ...result }, finalizationPending: true }).catch(() => false);
     if (autoRun) {

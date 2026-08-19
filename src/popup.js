@@ -72,9 +72,13 @@
     state.runtime = runtimeState;
     const run = runtimeState.run || {};
     const actions = Object.values(runtimeState.actionsByTabId || {});
+    const dailyStatus = runtimeState.dailyStatus || {};
 
     const checkinRecord = actions.find((a) => a.action === 'checkin');
     const questionRecord = actions.find((a) => a.action === 'question');
+
+    const isCheckinDone = Boolean(dailyStatus.checkin?.completed || checkinRecord?.status === 'completed');
+    const isQuestionDone = Boolean(dailyStatus.question?.completed || questionRecord?.status === 'completed');
 
     // 1. 检查任务受阻情况
     const blockedInfo = getBlockedInfo(runtimeState);
@@ -89,10 +93,12 @@
     }
 
     // 2. 渲染各任务状态
-    const renderTaskBadge = (node, record, isCurrentStage, isRunning) => {
+    const isRunning = run.status === 'running' || state.pendingAction;
+
+    const renderTaskBadge = (node, isDone, record, isCurrentStage) => {
       if (!node) return;
       node.className = 'task-badge';
-      if (record?.status === 'completed') {
+      if (isDone) {
         node.classList.add('badge-done');
         node.textContent = '已完成';
       } else if (isRunning && isCurrentStage) {
@@ -107,22 +113,27 @@
       }
     };
 
-    const isRunning = run.status === 'running' || state.pendingAction;
-    renderTaskBadge(els.checkinTaskStatus, checkinRecord, run.stage === 'checkin', isRunning);
-    renderTaskBadge(els.questionTaskStatus, questionRecord, run.stage === 'question', isRunning);
+    renderTaskBadge(els.checkinTaskStatus, isCheckinDone, checkinRecord, run.stage === 'checkin');
+    renderTaskBadge(els.questionTaskStatus, isQuestionDone, questionRecord, run.stage === 'question');
 
-    // 3. 总体状态 Badge
+    // 3. 总体状态 Badge 与引导文案
     if (els.overallStatusBadge) {
       els.overallStatusBadge.className = 'badge';
-      if (checkinRecord?.status === 'completed' && questionRecord?.status === 'completed') {
+      if (isCheckinDone && isQuestionDone) {
         els.overallStatusBadge.classList.add('badge-done');
         els.overallStatusBadge.textContent = '已全部完成';
+        if (!state.pendingAction) {
+          setStatus('今日签到与答题已全部搞定 🎉');
+        }
       } else if (isRunning) {
         els.overallStatusBadge.classList.add('badge-running');
         els.overallStatusBadge.textContent = '执行中…';
       } else if (blockedInfo) {
         els.overallStatusBadge.classList.add('badge-error');
         els.overallStatusBadge.textContent = '需人工处理';
+      } else if (isCheckinDone || isQuestionDone) {
+        els.overallStatusBadge.classList.add('badge-done');
+        els.overallStatusBadge.textContent = isCheckinDone ? '签到已完成' : '答题已完成';
       } else {
         els.overallStatusBadge.textContent = '就绪';
       }
@@ -188,7 +199,15 @@
       const runtimeState = await sendRuntimeMessage(ExtensionProtocol.MESSAGE_TYPES.GET_RUNTIME_STATE);
       render(runtimeState);
     } catch {
-      render({});
+      try {
+        const stored = await chrome?.storage?.local?.get?.(['p3a-daily-status-v1', 'p3a-runtime-v1']);
+        render({
+          ...(stored?.['p3a-runtime-v1'] || {}),
+          dailyStatus: stored?.['p3a-daily-status-v1'] || {},
+        });
+      } catch {
+        render({});
+      }
     } finally {
       state.loading = false;
     }

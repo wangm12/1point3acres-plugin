@@ -124,7 +124,7 @@ const makeMockDom = () => {
   assert.deepEqual(focusedTab, { tabId: 42, active: true }, 'should focus the blocked task tab');
   assert.equal(closedWindow, true, 'popup should close after focusing task tab');
 
-  // 测试全部完成状态
+  // 测试全部完成状态（来自 actionsByTabId）
   popup.render({
     run: { status: 'idle' },
     actionsByTabId: {
@@ -134,6 +134,21 @@ const makeMockDom = () => {
   });
 
   assert.equal(elements.get('alert-banner').hidden, true, 'alert banner should be hidden when completed');
+  assert.equal(elements.get('overall-status-badge').textContent, '已全部完成');
+  assert.equal(elements.get('checkin-task-status').textContent, '已完成');
+  assert.equal(elements.get('question-task-status').textContent, '已完成');
+
+  // 测试持久化 dailyStatus 完成状态（即使 actionsByTabId 为空/已清空）
+  popup.render({
+    run: { status: 'idle' },
+    actionsByTabId: {},
+    dailyStatus: {
+      dateKey: '2026-08-18',
+      checkin: { completed: true, at: 1000 },
+      question: { completed: true, at: 2000 },
+    },
+  });
+
   assert.equal(elements.get('overall-status-badge').textContent, '已全部完成');
   assert.equal(elements.get('checkin-task-status').textContent, '已完成');
   assert.equal(elements.get('question-task-status').textContent, '已完成');
