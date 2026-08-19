@@ -4,17 +4,52 @@
   const SUBMIT_TEXT = /提交答案|确认答案|提交|confirm\s*answer|submit/i;
   const STATUS = Object.freeze({
     login: /请先登录|请登录|登录后|login required|sign in/i,
-    completed: /今日已答题|已经答过|今日答题已完成|already answered/i,
+    completed: /今日已答题|已经答过|今日答题已完成|答题成功|already answered/i,
   });
+  const COMPLETED_CONTROL = /^(?:今日已答题|已经答过|今日答题已完成|already answered)$/i;
   const clean = (value) => String(value?.textContent ?? value ?? '').replace(/\s+/g, ' ').trim();
   const cleanQuestionText = (value) => String(value || '').replace(/^(?:【(?:题目|问题)】|(?:题目|问题)\s*[:：])\s*/u, '').trim();
   const withinToolbar = (node) => Boolean(node?.closest?.(`#${TOOLBAR_ID}`));
+  const scopeNodes = (root, selector) => Array.from(root.querySelectorAll?.(selector) || []).filter((node) => !withinToolbar(node));
+  const containsQuestionSignal = (node) => {
+    if (!node) return false;
+    return Boolean(
+      node.querySelector?.('[data-question-container], [data-question], [class*="question"], [class*="daily-question"], [role="heading"], h1, h2, h3')
+      || clean(node).length > 8 && /[?？]/.test(clean(node)),
+    );
+  };
+  const taskScope = (root = global.document) => {
+    const questionAnchors = [...scopeNodes(root, '[data-question-container]'), ...scopeNodes(root, '[data-question]')];
+    const questionContainers = questionAnchors
+      .map((node) => node.closest?.('[data-question-container], [data-question], [class*="daily-question"], main, [role="main"]') || node)
+      .filter((node, index, all) => all.indexOf(node) === index);
+    const questionScope = questionContainers.find((node) => containsQuestionSignal(node) && (node.querySelector?.('button,[role="option"]') || node.querySelector?.('h1,h2,h3,[role="heading"],[class*="question"]')));
+    if (questionScope) return questionScope;
+    const heading = scopeNodes(root, 'main h1, main h2, main h3, main [role="heading"], [class*="question"], [class*="daily-question"]')
+      .map((node) => node.closest?.('[data-question-container], [data-question], [class*="daily-question"], main, [role="main"]') || node)
+      .find((node) => containsQuestionSignal(node) && node.querySelector?.('button,[role="option"]'));
+    if (heading) return heading;
+    const nestedMain = scopeNodes(root, 'main main').find((node) => node.querySelector?.('button,[role="option"], h1,h2,h3,[role="heading"]'));
+    if (nestedMain) return nestedMain;
+    const main = scopeNodes(root, 'main').find((node) => containsQuestionSignal(node) && node.querySelector?.('button,[role="option"]'));
+    if (main) return main;
+    return null;
+  };
   const isVisible = (node) => {
     if (!node || node.hidden || node.getAttribute?.('aria-hidden') === 'true') return false;
     const style = global.getComputedStyle?.(node);
     return !style || (style.display !== 'none' && style.visibility !== 'hidden');
   };
   const isQuestionPage = (url = global.location?.href || '') => /\/next\/daily-question\/?(?:[?#].*)?$/.test(url);
+  const hasCompletedControl = (root = global.document, scope = taskScope(root)) => {
+    const searchRoot = scope || root;
+    const controls = Array.from(searchRoot.querySelectorAll?.('button,input[type="button"],input[type="submit"],[role="button"]') || []);
+    return controls.some((node) => {
+      if (withinToolbar(node)) return false;
+      if (!node.disabled && node.getAttribute?.('aria-disabled') !== 'true') return false;
+      return COMPLETED_CONTROL.test(clean(node));
+    });
+  };
 
   function scoreQuestion(node) {
     const value = clean(node);
@@ -82,7 +117,7 @@
   function findOptions(root = global.document, container = findQuestionContainer(root)) {
     const scope = container?.querySelector?.('button,[role="option"]')
       ? container
-      : container?.closest?.('main') || root.querySelector?.('main') || root;
+      : container?.closest?.('main main, main, [role="main"]') || root.querySelector?.('main main, main, [role="main"], main') || root;
     const local = Array.from(scope.querySelectorAll?.('button,[role="option"]') || []).filter(isOption);
     const optionLike = local.filter(isOptionLike);
     if (optionLike.length >= 2) {
@@ -128,9 +163,10 @@
   }
 
   function getState(root = global.document) {
-    const body = String(root.body?.innerText || root.body?.textContent || '');
+    const scope = taskScope(root);
+    const body = scope ? String(scope.innerText || scope.textContent || '') : String(root.body?.innerText || root.body?.textContent || '');
     if (STATUS.login.test(body)) return 'requires-login';
-    if (STATUS.completed.test(body)) return 'completed';
+    if (hasCompletedControl(root, scope) || STATUS.completed.test(body)) return 'completed';
     return 'active';
   }
 

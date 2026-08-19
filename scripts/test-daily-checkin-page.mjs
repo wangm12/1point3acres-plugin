@@ -7,7 +7,7 @@ const make = (html, url = 'https://www.1point3acres.com/next/daily-checkin') => 
   const nodes = [];
   const parse = (tag, attrs, body) => {
     const map = Object.fromEntries([...attrs.matchAll(/([\w-]+)(?:="([^"]*)")?/g)].map((m) => [m[1], m[2] ?? '']));
-    const n = { textContent: body, hidden: false, disabled: false, ownerDocument: null, attributes: map, getAttribute(k) { return this.attributes[k] ?? null; }, matches() { return false; }, closest() { return null; } };
+    const n = { textContent: body, hidden: false, disabled: Object.prototype.hasOwnProperty.call(map, 'disabled'), ownerDocument: null, attributes: map, getAttribute(k) { return this.attributes[k] ?? null; }, matches() { return false; }, closest() { return null; } };
     nodes.push(n); return n;
   };
   const body = { textContent: html.replace(/<[^>]+>/g, ' '), innerText: html.replace(/<[^>]+>/g, ' ') };
@@ -28,6 +28,10 @@ x = make('<button>提交签到</button>'); assert(x.api.findSubmit(x.document));
 x = make('<input type="submit" value="提交签到"></input>'); assert(x.api.findSubmit(x.document));
 x = make('<button>请先登录</button>'); assert.equal(x.api.getState(x.document), 'requires-login');
 x = make('<div>今日已签到</div>'); assert.equal(x.api.getState(x.document), 'completed');
+x = make('<main><button>没心情</button><div>恭喜你签到成功!获得奖励 大米 1 升</div></main>'); assert.equal(x.api.getState(x.document), 'completed');
+x = make('<main><button>没心情</button></main><div>恭喜你签到成功!获得奖励 大米 1 升</div>'); assert.equal(x.api.getState(x.document), 'completed');
+x = make('<main><button disabled>今日已签到</button><div>您累计已签到 200 天</div></main>'); assert.equal(x.api.getState(x.document), 'completed');
+x = make('<main><div>您累计已签到 200 天</div></main>'); assert.equal(x.api.getState(x.document), 'active');
 x = make('<button>心情很好</button><textarea></textarea>'); assert.equal(x.api.findDefault(x.document), null);
 x = make('<button class="hover:bg-primary-light rounded-md border hover:cursor-pointer">X 没心情</button>'); assert(x.api.findDefault(x.document));
 x = make('<button class="hover:bg-primary-light rounded-md border hover:cursor-pointer">其他心情</button>'); assert.equal(x.api.findDefault(x.document), null);

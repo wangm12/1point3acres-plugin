@@ -34,6 +34,7 @@ const bridge = Object.freeze({
 
 const toolbarId = 'p3a-daily-question-helper';
 const checkinToolbarId = DailyCheckinPage.TOOLBAR_ID;
+const getQuestionToolbar = () => document.getElementById(toolbarId);
 const checkinToastId = 'p3a-checkin-complete-toast';
 let checkinToastTimer = null;
 const showCheckinToast = (message = '签到完成') => {
@@ -57,20 +58,151 @@ const pendingRemoteActions = new Set();
 const remoteActionTimers = new Map();
 const remoteActionResults = new Map();
 const remoteActionToastMessages = new Map();
-const REMOTE_ACTION_TIMEOUT_MS = 8000;
-const QUESTION_READY_TIMEOUT_MS = 3000;
+const REMOTE_ACTION_TIMEOUT_MS = 5000;
+// Keep the initial render and the full one-click question action within the
+// same bounded five-second budget.
+const QUESTION_READY_TIMEOUT_MS = 5000;
 const REMOTE_ACTION_RETRY_MS = 200;
 let activeRemoteActionId = null;
 const REMOTE_RESULT_TIMEOUT_MS = 12000;
 const REMOTE_RESULT_REPORT_MAX_RETRIES = 5;
 const REMOTE_RESULT_REPORT_DELAY_MS = 200;
+const REMOTE_RESULT_STORAGE_KEY = 'p3a-pending-remote-results-v1';
 const QUESTION_SUBMIT_WAIT_MS = 4000;
 const QUESTION_SUBMIT_POLL_MS = 100;
 const CHECKIN_SUBMIT_WAIT_MS = 2000;
 const CHECKIN_SUBMIT_POLL_MS = 100;
+const QUESTION_LOOKUP_RESPONSE_TIMEOUT_MS = 1500;
+const QUESTION_LOOKUP_RETRY_DELAY_MS = 250;
 let questionStatusNode = null;
 let checkinStatusNode = null;
+let lastReportedPageSignature = null;
+let pendingRemoteResultStore = null;
+let pendingRemoteResultStorePromise = null;
+const resultStorage = chrome.storage?.local || null;
 const cleanTextValue = (value) => String(value?.textContent ?? value ?? '').replace(/\s+/g, ' ').trim();
+const awaitResponseOrTimeout = (promise, timeoutMs) => new Promise((resolve) => {
+  let settled = false;
+  const finish = (value) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    resolve(value);
+  };
+  const timer = setTimeout(() => finish(null), timeoutMs);
+  Promise.resolve(promise).then(finish, () => finish(null));
+});
+const lookupQuestionForRender = async (question, options, timeoutMs = QUESTION_LOOKUP_RESPONSE_TIMEOUT_MS) => {
+  try {
+    const response = await awaitResponseOrTimeout(
+      bridge.send(ExtensionProtocol.MESSAGE_TYPES.LOOKUP_QUESTION, { question, options }),
+      timeoutMs,
+    );
+    return response?.payload || null;
+  } catch {
+    return null;
+  }
+};
+const getTaskPageUrl = (url = location.href) => {
+  try {
+    const parsed = new URL(url, location.origin);
+    if (detectPageKind(parsed.href) === 'daily-question') return `${parsed.origin}/next/daily-question`;
+    if (detectPageKind(parsed.href) === 'daily-checkin') return `${parsed.origin}/next/daily-checkin`;
+    return parsed.origin + parsed.pathname;
+  } catch {
+    return String(url || '');
+  }
+};
+const getTabIdentity = () => {
+  if (!globalThis.__p3aTabIdentity) {
+    const existing = typeof window?.name === 'string' ? window.name : '';
+    const match = existing.match(/(?:^|\|)p3a-tab-([a-z0-9-]+)(?:\||$)/i);
+    const token = match?.[1] || (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    globalThis.__p3aTabIdentity = `p3a-tab-${token}`;
+    if (typeof window?.name === 'string' && !window.name.includes(globalThis.__p3aTabIdentity)) {
+      window.name = window.name ? `${window.name}|${globalThis.__p3aTabIdentity}` : globalThis.__p3aTabIdentity;
+    }
+  }
+  return globalThis.__p3aTabIdentity;
+};
+const getPendingRemoteResultScope = () => ({
+  pageKind: detectPageKind(),
+  taskUrl: getTaskPageUrl(),
+  tabIdentity: getTabIdentity(),
+});
+const isSamePendingRemoteResultScope = (record, scope = getPendingRemoteResultScope()) => {
+  if (!record || typeof record !== 'object') return false;
+  if (record.pageKind !== scope.pageKind) return false;
+  if (record.taskUrl !== scope.taskUrl) return false;
+  return record.tabIdentity === scope.tabIdentity;
+};
+const loadPendingRemoteResultStore = async () => {
+  if (!resultStorage?.get || !resultStorage?.set) {
+    pendingRemoteResultStore = pendingRemoteResultStore || {};
+    return pendingRemoteResultStore;
+  }
+  if (pendingRemoteResultStore) return pendingRemoteResultStore;
+  if (!pendingRemoteResultStorePromise) {
+    pendingRemoteResultStorePromise = resultStorage.get(REMOTE_RESULT_STORAGE_KEY).then((stored) => {
+      const records = stored?.[REMOTE_RESULT_STORAGE_KEY];
+      pendingRemoteResultStore = records && typeof records === 'object' ? { ...records } : {};
+      return pendingRemoteResultStore;
+    }).catch(() => {
+      pendingRemoteResultStore = {};
+      return pendingRemoteResultStore;
+    }).finally(() => {
+      pendingRemoteResultStorePromise = null;
+    });
+  }
+  return pendingRemoteResultStorePromise;
+};
+const savePendingRemoteResultStore = async () => {
+  await loadPendingRemoteResultStore();
+  if (!resultStorage?.set) return;
+  await resultStorage.set({ [REMOTE_RESULT_STORAGE_KEY]: pendingRemoteResultStore || {} }).catch(() => {});
+};
+const queuePendingRemoteResult = async (actionId, result) => {
+  if (!actionId) return;
+  await loadPendingRemoteResultStore();
+  const scope = getPendingRemoteResultScope();
+  pendingRemoteResultStore[actionId] = {
+    ...result,
+    actionId,
+    pageKind: scope.pageKind,
+    taskUrl: scope.taskUrl,
+    tabIdentity: scope.tabIdentity,
+    url: location.href,
+    updatedAt: Date.now(),
+  };
+  await savePendingRemoteResultStore();
+};
+const clearPendingRemoteResult = async (actionId) => {
+  if (!actionId) return;
+  await loadPendingRemoteResultStore();
+  if (!pendingRemoteResultStore[actionId]) return;
+  delete pendingRemoteResultStore[actionId];
+  await savePendingRemoteResultStore();
+};
+const getPendingRemoteResult = async (actionId) => {
+  if (!actionId) return null;
+  const store = await loadPendingRemoteResultStore();
+  const record = store?.[actionId];
+  return record && typeof record === 'object' ? { ...record } : null;
+};
+const detectPageState = () => {
+  if (isQuestionPage()) return DailyQuestionPage.getState();
+  if (isCheckinPage()) return DailyCheckinPage.getState();
+  return 'unknown';
+};
+const getContentReadySignature = () => `${detectPageKind()}:${detectPageState()}`;
+const reportContentReady = (force = false) => {
+  const pageSignature = getContentReadySignature();
+  if (!force && pageSignature === lastReportedPageSignature) return;
+  lastReportedPageSignature = pageSignature;
+  const pageState = pageSignature.slice(pageSignature.indexOf(':') + 1);
+  bridge.send(ExtensionProtocol.MESSAGE_TYPES.CONTENT_READY, { pageKind: detectPageKind(), pageState }).catch(() => {});
+  flushPendingRemoteResults().catch(() => {});
+};
 const clickVisibleQuestionSubmit = (button) => {
   // Next/React may replace the submit node after the option click. Never
   // reject a valid submission merely because the node identity changed.
@@ -84,21 +216,44 @@ const clickVisibleQuestionSubmit = (button) => {
   throw new Error('submit-button-not-clickable');
 };
 const reportingRemoteActions = new Set();
+const finalizeDeliveredRemoteResult = async (actionId, result) => {
+  if (remoteActionResults.has(actionId)) {
+    remoteActionResults.set(actionId, { ...remoteActionResults.get(actionId), delivered: true });
+  }
+  await clearPendingRemoteResult(actionId);
+  if (result?.status === 'success') {
+    const toastMessage = result?.toastMessage || remoteActionToastMessages.get(actionId) || (result?.action === 'question' ? '答题完成' : '签到完成');
+    showCheckinToast(toastMessage);
+  }
+  remoteActionToastMessages.delete(actionId);
+  return true;
+};
 const reportRemoteResult = async (actionId, action, status, reason) => {
   if (!actionId) return false;
   const result = remoteActionResults.get(actionId);
-  if (result?.delivered === true) return true;
+  const pendingResult = await getPendingRemoteResult(actionId);
+  const payload = pendingResult || {
+    actionId,
+    action,
+    status,
+    reason,
+    toastMessage: remoteActionToastMessages.get(actionId) || (action === 'question' ? '答题完成' : '签到完成'),
+  };
+  if (result?.delivered === true && !pendingResult) return true;
   if (reportingRemoteActions.has(actionId)) return false;
   reportingRemoteActions.add(actionId);
   try {
+    await queuePendingRemoteResult(actionId, payload);
     for (let attempt = 1; attempt <= REMOTE_RESULT_REPORT_MAX_RETRIES; attempt += 1) {
       try {
-        const response = await bridge.send(ExtensionProtocol.MESSAGE_TYPES.ACTION_RESULT, { actionId, action, status, reason });
-        if (response?.ok === true) {
-          if (remoteActionResults.has(actionId)) {
-            remoteActionResults.set(actionId, { action, status, reason, delivered: true });
-          }
-          return true;
+        const response = await bridge.send(ExtensionProtocol.MESSAGE_TYPES.ACTION_RESULT, {
+          actionId,
+          action: payload.action,
+          status: payload.status,
+          reason: payload.reason,
+        });
+        if (response?.ok === true && response?.accepted === true && (!response?.actionId || response.actionId === actionId)) {
+          return finalizeDeliveredRemoteResult(actionId, payload);
         }
       } catch {}
       if (attempt < REMOTE_RESULT_REPORT_MAX_RETRIES) {
@@ -119,33 +274,158 @@ const finishRemoteAction = (actionId, action, status, reason) => {
     if (status === 'success') showCheckinToast(toastMessage);
     return;
   }
-  remoteActionResults.set(actionId, { action, status, reason, delivered: false });
+  remoteActionResults.set(actionId, { action, status, reason, delivered: false, toastMessage });
   remoteActionTimers.delete(actionId);
   pendingRemoteActions.delete(actionId);
   if (activeRemoteActionId === actionId) activeRemoteActionId = null;
-  if (status === 'success') showCheckinToast(toastMessage);
-  remoteActionToastMessages.delete(actionId);
   reportRemoteResult(actionId, action, status, reason).catch(() => {});
+};
+const pauseRemoteAction = (actionId, action, reason) => {
+  if (!actionId) {
+    activeRemoteActionId = null;
+    return;
+  }
+  remoteActionTimers.delete(actionId);
+  pendingRemoteActions.delete(actionId);
+  if (activeRemoteActionId === actionId) activeRemoteActionId = null;
+  remoteActionToastMessages.delete(actionId);
+  reportRemoteResult(actionId, action, 'login-blocked', reason).catch(() => {});
+};
+const CAPTCHA_TEXT_RE = /请输入验证码|请填写验证码|填写验证码|验证码|captcha|verification code|security check|请完成(?:安全)?验证|安全验证|人机验证|滑动验证|点选验证|点击倒立文字|拖动滑块|完成拼图|点击图中的|验证码已过期|请重新验证|turnstile|geetest/i;
+const CAPTCHA_ERROR_RE = /验证码错误/i;
+const CAPTCHA_ATTR_RE = /captcha|verify|verification|challenge|geetest|gt[-_]?captcha|hcaptcha|recaptcha|turnstile|aliyun|yidun|tcaptcha|arkoselabs|funcaptcha|mcaptcha|dx-captcha|vaptcha/i;
+const CAPTCHA_WIDGET_TAG_RE = /^(?:IFRAME|IMG|CANVAS|OBJECT|EMBED)$/i;
+const CAPTCHA_WIDGET_ROLE_RE = /button|dialog|group|presentation|region/i;
+const readNodeText = (node) => String(node?.innerText || node?.textContent || '').replace(/\s+/g, ' ').trim();
+const readNodeAttributes = (node) => {
+  const names = ['id', 'class', 'name', 'role', 'title', 'aria-label', 'placeholder', 'src', 'data-testid', 'data-test', 'data-widget', 'data-captcha', 'data-sitekey'];
+  return names
+    .map((name) => {
+      if (name === 'class') return String(node?.className || '');
+      return String(node?.getAttribute?.(name) || '');
+    })
+    .filter(Boolean)
+    .join(' ');
+};
+const hasShadowTree = (node) => Boolean(node?.shadowRoot && (node.shadowRoot.children?.length || node.shadowRoot.querySelector?.('*')));
+const walkScopeNodes = (root, visitor) => {
+  const queue = [root];
+  const visited = new Set();
+  while (queue.length) {
+    const node = queue.shift();
+    if (!node || visited.has(node)) continue;
+    visited.add(node);
+    if (visitor(node) === true) return true;
+    for (const child of node.children || []) queue.push(child);
+    if (node.shadowRoot) queue.push(node.shadowRoot);
+  }
+  return false;
+};
+const hasConservativeCaptchaPrompt = (taskRoot) => {
+  if (!taskRoot) return false;
+
+  // 1. Check for global overlay or modal iframes attached to the document body
+  if (typeof document?.querySelector === 'function') {
+    const globalCaptchaEl = document.querySelector(
+      'iframe[src*="captcha"], iframe[src*="geetest"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="turnstile"], .geetest_holder, .g-recaptcha, .cf-turnstile, [class*="captcha-modal"], [class*="captcha_modal"], [id*="captcha_box"], [id*="geetest"], [class*="yidun"], [class*="tcaptcha"]'
+    );
+    if (globalCaptchaEl) return true;
+  }
+
+  const scopeText = readNodeText(taskRoot);
+  if (CAPTCHA_ERROR_RE.test(scopeText)) return false;
+  const scopeMentionsCaptcha = CAPTCHA_TEXT_RE.test(scopeText);
+  let hasDirectPromptControl = false;
+  let hasSuspiciousWidget = false;
+  walkScopeNodes(taskRoot, (node) => {
+    if (node === taskRoot) return false;
+    const tagName = String(node?.tagName || '').toUpperCase();
+    const attrs = readNodeAttributes(node);
+    const nodeText = readNodeText(node);
+    const combined = `${attrs} ${nodeText}`.trim();
+    const attrHint = CAPTCHA_ATTR_RE.test(combined);
+    if ((tagName === 'INPUT' || tagName === 'TEXTAREA') && (scopeMentionsCaptcha || attrHint || CAPTCHA_TEXT_RE.test(nodeText))) {
+      hasDirectPromptControl = true;
+      return true;
+    }
+    if ((tagName === 'BUTTON' || String(node?.getAttribute?.('role') || '').match(CAPTCHA_WIDGET_ROLE_RE)) && (scopeMentionsCaptcha || attrHint || CAPTCHA_TEXT_RE.test(nodeText))) {
+      hasDirectPromptControl = true;
+      return true;
+    }
+    if (attrHint || (hasShadowTree(node) && (scopeMentionsCaptcha || attrHint)) || (CAPTCHA_WIDGET_TAG_RE.test(tagName) && (scopeMentionsCaptcha || attrHint))) {
+      hasSuspiciousWidget = true;
+    }
+    return false;
+  });
+  return hasDirectPromptControl || hasSuspiciousWidget;
+};
+const getRemoteResultScope = (action) => {
+  if (action === 'question') {
+    return DailyQuestionPage.findQuestionContainer(document)
+      || DailyQuestionPage.findQuestion(document).node?.closest?.('main')
+      || document.querySelector?.('main')
+      || document.body;
+  }
+  const defaultNode = DailyCheckinPage.findDefault();
+  return defaultNode?.closest?.('[data-checkin], [data-page="daily-checkin"], [class*="daily-checkin"], form, main')
+    || document.querySelector?.('main')
+    || document.body;
 };
 const waitForRemoteResult = (action, actionId, status) => new Promise((resolve) => {
   const started = Date.now();
   const timer = setInterval(() => {
     const state = action === 'question' ? DailyQuestionPage.getState() : DailyCheckinPage.getState();
-    const body = String(document.body?.innerText || '');
+    const taskRoot = getRemoteResultScope(action);
+    const scopedBody = String(taskRoot?.innerText || taskRoot?.textContent || '');
+    // Success toasts are sometimes mounted outside the form/main returned by
+    // getRemoteResultScope. Include the page text as a fallback so a genuine
+    // submission cannot time out merely because the toast moved in the DOM.
+    const documentBody = String(document.body?.innerText || document.body?.textContent || '');
+    const body = action === 'checkin' && scopedBody !== documentBody
+      ? `${scopedBody}\n${documentBody}`
+      : scopedBody;
+    const hasCaptchaPrompt = hasConservativeCaptchaPrompt(taskRoot);
     const successText = action === 'question'
       ? /答题成功|恭喜[\s\S]{0,20}(?:答对|回答正确)[\s\S]{0,20}(?:获得|得到|赢得)[\s\S]{0,12}(?:大米|米)|(?:已获得|已到账|到账)[\s\S]{0,12}(?:大米|米)|今日已答题|已经答过/i
       : /签到成功|签到完成|今日已签到|已经签到/i;
+    if (CAPTCHA_ERROR_RE.test(body)) {
+      clearInterval(timer); finishRemoteAction(actionId, action, 'failed', 'captcha-error'); resolve(false); return;
+    }
+    if (hasCaptchaPrompt) {
+      clearInterval(timer); finishRemoteAction(actionId, action, 'failed', 'captcha-required'); resolve(false); return;
+    }
     if (state === 'completed' || successText.test(body)) {
       clearInterval(timer); finishRemoteAction(actionId, action, 'success', 'completed'); resolve(true); return;
     }
-    if (state === 'requires-login' || /验证码错误|提交失败|操作失败|系统错误/i.test(body)) {
-      clearInterval(timer); finishRemoteAction(actionId, action, 'failed', state === 'requires-login' ? 'requires-login' : 'site-failed'); resolve(false); return;
+    if (state === 'requires-login') {
+      clearInterval(timer); pauseRemoteAction(actionId, action, 'requires-login'); resolve(false); return;
+    }
+    if (/提交失败|操作失败|系统错误/i.test(body)) {
+      clearInterval(timer); finishRemoteAction(actionId, action, 'failed', 'site-failed'); resolve(false); return;
     }
     if (Date.now() - started >= REMOTE_RESULT_TIMEOUT_MS) {
       clearInterval(timer); finishRemoteAction(actionId, action, 'failed', 'timeout'); resolve(false);
     }
   }, 200);
 });
+const flushPendingRemoteResults = async () => {
+  const store = await loadPendingRemoteResultStore();
+  const scope = getPendingRemoteResultScope();
+  const entries = Object.entries(store || {});
+  for (const [actionId, result] of entries) {
+    if (!result || typeof result !== 'object') {
+      delete pendingRemoteResultStore[actionId];
+      continue;
+    }
+    if (!result.actionId || result.actionId !== actionId || !result.pageKind || !result.taskUrl || !result.tabIdentity) {
+      delete pendingRemoteResultStore[actionId];
+      continue;
+    }
+    if (!isSamePendingRemoteResultScope(result, scope)) continue;
+    await reportRemoteResult(actionId, result.action, result.status, result.reason);
+  }
+  await savePendingRemoteResultStore();
+};
 const waitForQuestionSubmit = async (questionKey, optionTexts, answerText) => {
   const startedAt = Date.now();
   while (Date.now() - startedAt < QUESTION_SUBMIT_WAIT_MS) {
@@ -212,6 +492,7 @@ const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) =>
     pendingRemoteActions.add(actionId);
     activeRemoteActionId = actionId;
     remoteActionToastMessages.set(actionId, workflowId ? '签到和答题完成' : '答题完成');
+    answerActionId = actionId;
   }
   const status = questionStatusNode || { textContent: '' };
   const failRemote = actionId ? (reason) => finishRemoteAction(actionId, 'question', 'failed', reason) : () => {};
@@ -221,10 +502,13 @@ const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) =>
     while (Date.now() - startedAt < REMOTE_ACTION_TIMEOUT_MS) {
       const snapshot = await waitForStableQuestionSnapshot(startedAt, questionReadyTimeoutMs);
       if (!snapshot.ok) {
+        if (snapshot.reason === 'requires-login') {
+          pauseRemoteAction(actionId, 'question', 'requires-login');
+          status.textContent = '需登录：登录后会自动继续答题';
+          return;
+        }
         failRemote(snapshot.reason);
-        status.textContent = snapshot.reason === 'requires-login'
-          ? '需登录：不能一键答题'
-          : snapshot.reason === 'question-not-ready'
+        status.textContent = snapshot.reason === 'question-not-ready'
             ? '题目或选项未稳定，未提交'
             : '题目或选项已变化，未提交';
         return;
@@ -264,7 +548,7 @@ const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) =>
         return;
       }
       const target = matching[0];
-      const actionKey = `${snapshot.question}:${lookupAnswerText}`;
+      const actionKey = `${actionId || 'local'}:${snapshot.question}:${lookupAnswerText}`;
       if (actionKey === answerActionKey) { failRemote('duplicate-action'); status.textContent = '已一键答题，等待站点结果'; return; }
       const selected = DailyQuestionPage.findSelectedOption(document, currentOptions);
       if (selected !== target) {
@@ -286,6 +570,8 @@ const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) =>
       answerActionKey = actionKey;
       status.textContent = '已触发官网提交，等待结果（如有验证码请完成）';
       await waitForRemoteResult('question', actionId, status);
+      answerActionKey = null;
+      answerActionId = null;
       return;
     }
     failRemote('question-not-ready');
@@ -293,6 +579,7 @@ const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) =>
     return;
   } catch {
     answerActionKey = null;
+    answerActionId = null;
     failRemote('action-failed');
     status.textContent = '一键答题未完成，请重试或按站点提示手动操作';
   }
@@ -301,28 +588,41 @@ const runCheckinAction = async ({ actionId = null } = {}) => {
   if (actionId) {
     pendingRemoteActions.add(actionId);
     activeRemoteActionId = actionId;
+    checkinActionId = actionId;
   }
   const status = checkinStatusNode || { textContent: '' };
   const failRemote = actionId ? (reason) => finishRemoteAction(actionId, 'checkin', 'failed', reason) : () => {};
   try {
     const currentState = DailyCheckinPage.getState();
-    if (currentState === 'requires-login') { failRemote('requires-login'); status.textContent = '需登录：不能一键签到'; return; }
+    if (currentState === 'requires-login') { pauseRemoteAction(actionId, 'checkin', 'requires-login'); status.textContent = '需登录：登录后会自动继续签到'; return; }
     if (currentState === 'completed') { finishRemoteAction(actionId, 'checkin', 'success', 'already-completed'); status.textContent = '已完成：今日已签到'; return; }
     const current = DailyCheckinPage.findDefault();
     if (!current) { failRemote('default-option-not-found'); status.textContent = '未找到“没心情”默认选项，未提交'; return; }
-    const key = `${location.href}:${CheckinState.nodeSignature(current)}`;
+    const signature = CheckinState.nodeSignature(current);
+    const key = `${actionId || 'local'}:${location.href}:${signature}`;
     if (checkinActionKey === key) { failRemote('duplicate-action'); status.textContent = '已一键签到，等待站点结果'; return; }
     current.click();
     // Selecting a mood can cause the site to re-render the submit button.
     // Always resolve the live site-owned button after the selection event.
     const submit = await waitForCheckinSubmit();
     if (!submit) { failRemote('submit-not-found'); status.textContent = '未找到站点签到按钮，未提交'; return; }
+    const latestState = DailyCheckinPage.getState();
+    const latestCurrent = DailyCheckinPage.findDefault();
+    const latestSignature = CheckinState.nodeSignature(latestCurrent);
+    if (latestState !== 'active' || !latestCurrent || latestSignature !== signature) {
+      failRemote('checkin-changed-or-unavailable');
+      status.textContent = '签到页面或默认选项已变化，未提交';
+      return;
+    }
     checkinActionKey = key;
     submit.click();
     status.textContent = '已触发官网提交，等待结果（如有验证码请完成）';
     await waitForRemoteResult('checkin', actionId, status);
+    checkinActionKey = null;
+    checkinActionId = null;
   } catch {
     checkinActionKey = null;
+    checkinActionId = null;
     failRemote('action-failed');
     status.textContent = '一键签到未完成，请重试或按站点提示手动操作';
   }
@@ -364,7 +664,10 @@ let prepared = null;
 // may replace the option nodes after the click.
 let autoSelectedKey = null;
 let answerActionKey = null;
+let answerActionId = null;
 let renderGeneration = 0;
+let questionLookupRetryKey = null;
+let questionLookupRetryStartedAt = 0;
 const normalizeQuestion = (value) => QuestionMatcher.normalize(value);
 const clearAnswerMarks = (nodes = []) => nodes.forEach((node) => {
   node.classList?.remove('p3a-answer-correct', 'p3a-answer-incorrect');
@@ -379,29 +682,49 @@ const markAnswerOptions = (nodes, correctIndex) => nodes.forEach((node, index) =
 const render = async () => {
   if (!isQuestionPage()) return;
   const generation = ++renderGeneration;
-  let bar = document.getElementById(toolbarId);
+  let bar = getQuestionToolbar();
   if (!bar) { bar = document.createElement('section'); bar.id = toolbarId; bar.setAttribute('role', 'region'); bar.setAttribute('aria-label', '每日答题助手'); document.body.appendChild(bar); }
   const status = document.createElement('span'); status.className = 'p3a-status'; status.setAttribute('aria-live', 'polite');
   const questionResult = DailyQuestionPage.findQuestion(); const optionNodes = DailyQuestionPage.findOptions(document, DailyQuestionPage.findQuestionContainer()); const question = questionResult.value; const options = optionNodes.map(DailyQuestionPage.clean); bar.replaceChildren(status);
   const state = DailyQuestionPage.getState();
-  if (state === 'requires-login') { prepared = null; autoSelectedKey = null; answerActionKey = null; clearAnswerMarks(optionNodes); status.textContent = '需登录：请先登录一亩三分地'; return; }
-  if (state === 'completed') { prepared = null; autoSelectedKey = null; answerActionKey = null; clearAnswerMarks(optionNodes); status.textContent = '已完成：今日已答题'; return; }
-  if (!question || !options.length) { prepared = null; autoSelectedKey = null; clearAnswerMarks(optionNodes); status.textContent = '加载中或暂未识别到题目'; return; }
+  if (state === 'requires-login') { prepared = null; autoSelectedKey = null; answerActionKey = null; answerActionId = null; clearAnswerMarks(optionNodes); status.textContent = '需登录：请先登录一亩三分地'; return; }
+  if (state === 'completed') { prepared = null; autoSelectedKey = null; answerActionKey = null; answerActionId = null; clearAnswerMarks(optionNodes); status.textContent = '已完成：今日已答题'; return; }
+  if (!question || !options.length) { prepared = null; autoSelectedKey = null; questionLookupRetryKey = null; questionLookupRetryStartedAt = 0; clearAnswerMarks(optionNodes); status.textContent = '加载中或暂未识别到题目'; return; }
   const questionKey = normalizeQuestion(question);
   if (prepared && prepared.questionKey !== questionKey) prepared = null;
-  if (answerActionKey && !answerActionKey.startsWith(`${questionKey}:`)) answerActionKey = null;
+  if (answerActionKey && !answerActionKey.includes(`:${questionKey}:`)) { answerActionKey = null; answerActionId = null; }
   if (autoSelectedKey && autoSelectedKey !== questionKey) autoSelectedKey = null;
-  const result = (await bridge.send(ExtensionProtocol.MESSAGE_TYPES.LOOKUP_QUESTION, { question, options }).catch(() => null))?.payload;
+  if (questionLookupRetryKey !== questionKey) {
+    questionLookupRetryKey = questionKey;
+    questionLookupRetryStartedAt = Date.now();
+  }
+  const elapsedBeforeLookup = Date.now() - questionLookupRetryStartedAt;
+  const lookupBudgetMs = Math.max(0, QUESTION_READY_TIMEOUT_MS - elapsedBeforeLookup);
+  const result = lookupBudgetMs > 0
+    ? await lookupQuestionForRender(question, options, Math.min(QUESTION_LOOKUP_RESPONSE_TIMEOUT_MS, lookupBudgetMs))
+    : null;
   if (generation !== renderGeneration) return;
+  if (!result) {
+    const remainingMs = QUESTION_READY_TIMEOUT_MS - (Date.now() - questionLookupRetryStartedAt);
+    if (remainingMs > 0) {
+      status.textContent = '正在读取本地答案…';
+      setTimeout(() => { if (isQuestionPage()) schedule(); }, Math.min(QUESTION_LOOKUP_RETRY_DELAY_MS, remainingMs));
+    } else {
+      status.textContent = '本地答案读取超时，请稍后重试';
+    }
+    return;
+  }
+  questionLookupRetryKey = null;
+  questionLookupRetryStartedAt = 0;
   if (!result || result.status === 'unmatched' || result.status === 'ambiguous') {
-    prepared = null; autoSelectedKey = null; answerActionKey = null; clearAnswerMarks(optionNodes); status.textContent = result?.status === 'ambiguous' ? '多候选：请手动选择并保存，不能一键答题' : '未收录：请手动选择并保存，不能一键答题';
+    prepared = null; autoSelectedKey = null; answerActionKey = null; answerActionId = null; clearAnswerMarks(optionNodes); status.textContent = result?.status === 'ambiguous' ? '多候选：请手动选择并保存，不能一键答题' : '未收录：请手动选择并保存，不能一键答题';
     const remember = document.createElement('button'); remember.type = 'button'; remember.textContent = '记住当前答案'; remember.className = 'p3a-action';
     remember.addEventListener('click', async () => { const currentQuestionResult = DailyQuestionPage.findQuestion(); const currentOptions = DailyQuestionPage.findOptions(document, DailyQuestionPage.findQuestionContainer()); const selected = DailyQuestionPage.findSelectedOption(document, currentOptions); const currentQuestion = currentQuestionResult.value; if (!currentQuestion || currentQuestion !== question || currentOptions.length !== optionNodes.length || currentOptions.some((node, index) => node !== optionNodes[index]) || !selected || currentOptions.filter((node) => node === selected).length !== 1) { status.textContent = '题目或选项已变化，或没有唯一选中项，未保存'; return; } const response = await bridge.send(ExtensionProtocol.MESSAGE_TYPES.SAVE_LEARNED_ANSWER, { question: currentQuestion, answer: DailyQuestionPage.clean(selected) }).catch(() => null); status.textContent = response?.ok ? '已记住当前答案' : '保存失败，请稍后重试'; });
     bar.append(remember); return;
   }
-  if (!Number.isInteger(result.optionIndex) || result.optionIndex < 0 || result.optionIndex >= optionNodes.length || !optionNodes[result.optionIndex]) { prepared = null; answerActionKey = null; clearAnswerMarks(optionNodes); status.textContent = '命中答案索引无效，不能一键答题'; return; }
+  if (!Number.isInteger(result.optionIndex) || result.optionIndex < 0 || result.optionIndex >= optionNodes.length || !optionNodes[result.optionIndex]) { prepared = null; answerActionKey = null; answerActionId = null; clearAnswerMarks(optionNodes); status.textContent = '命中答案索引无效，不能一键答题'; return; }
   markAnswerOptions(optionNodes, result.optionIndex);
-  status.textContent = `已命中：${result.answerText}`;
+  status.textContent = result.matchType === 'fuzzy' ? `已基于相似题目自动匹配：${result.answerText}` : `已命中：${result.answerText}`;
   const select = document.createElement('button'); select.type = 'button'; select.textContent = '选中答案'; select.className = 'p3a-action';
   const remember = document.createElement('button'); remember.type = 'button'; remember.textContent = '记住当前答案'; remember.className = 'p3a-action';
   const submit = document.createElement('button'); submit.type = 'button'; submit.textContent = '确认并提交'; submit.className = 'p3a-action'; submit.disabled = true;
@@ -419,7 +742,14 @@ const render = async () => {
   }
   if (autoSelectedKey !== questionKey && selected !== target && typeof target.click === 'function') {
     autoSelectedKey = questionKey;
-    try { target.click(); prepared = { questionKey, optionIndex: result.optionIndex, node: target, answer: lookupAnswerText, optionTexts: lookupOptionTexts }; submit.disabled = false; status.textContent = `已自动选中：${result.answerText}，请检查后提交`; } catch { status.textContent = `已命中：${result.answerText}，请手动选择`; }
+    try {
+      target.click();
+      prepared = { questionKey, optionIndex: result.optionIndex, node: target, answer: lookupAnswerText, optionTexts: lookupOptionTexts };
+      submit.disabled = false;
+      status.textContent = result.matchType === 'fuzzy' ? `已基于相似题目自动选中：${result.answerText}，请检查后提交` : `已自动选中：${result.answerText}，请检查后提交`;
+    } catch {
+      status.textContent = result.matchType === 'fuzzy' ? `已基于相似题目自动匹配：${result.answerText}，请手动选择` : `已命中：${result.answerText}，请手动选择`;
+    }
   }
   select.addEventListener('click', () => { const node = optionNodes[result.optionIndex]; if (!node || typeof node.click !== 'function') return; try { node.click(); } catch { return; } prepared = { questionKey, optionIndex: result.optionIndex, node, answer: lookupAnswerText, optionTexts: lookupOptionTexts }; status.textContent = '已选中，请检查验证码后提交'; submit.disabled = false; });
   submit.addEventListener('click', () => { const currentOptions = DailyQuestionPage.findOptions(document, DailyQuestionPage.findQuestionContainer()); const currentQuestion = normalizeQuestion(DailyQuestionPage.findQuestion().value); const node = prepared && currentOptions[prepared.optionIndex]; const selected = DailyQuestionPage.findSelectedOption(document, currentOptions); if (!prepared || prepared.questionKey !== currentQuestion || !node || node !== prepared.node || selected !== node) { submit.disabled = true; status.textContent = '题目或选项已变化，或官网未确认选中，未提交'; return; } const button = DailyQuestionPage.findSubmit(); if (button && !button.disabled) { try { clickVisibleQuestionSubmit(button); status.textContent = '已触发官网提交，等待结果'; } catch { status.textContent = '官网提交按钮已变化，未提交，请重试'; } } else status.textContent = '未找到已启用的官网提交按钮，未提交'; });
@@ -429,6 +759,7 @@ const render = async () => {
 let checkinPrepared = null;
 let checkinAutoAttempt = null;
 let checkinActionKey = null;
+let checkinActionId = null;
 let checkinGeneration = 0;
 const isCheckinPage = () => DailyCheckinPage.isCheckinPage(location.href);
 const renderCheckin = () => {
@@ -494,7 +825,8 @@ const renderCheckin = () => {
     const failRemote = (reason) => finishRemoteAction(remoteActionId, 'checkin', 'failed', reason);
     const currentState = DailyCheckinPage.getState();
     const current = DailyCheckinPage.findDefault();
-    const key = `${location.href}|${CheckinState.nodeSignature(current)}`;
+    const signature = CheckinState.nodeSignature(current);
+    const key = `${location.href}|${signature}`;
     if (currentState === 'requires-login') { failRemote('requires-login'); status.textContent = '需登录：不能一键签到'; return; }
     if (currentState === 'completed') { finishRemoteAction(remoteActionId, 'checkin', 'success', 'already-completed'); status.textContent = '今日已签到'; return; }
     if (!current) { failRemote('default-option-not-found'); status.textContent = '未找到“没心情”默认选项，未提交'; return; }
@@ -503,6 +835,14 @@ const renderCheckin = () => {
       if (!CheckinState.reconcile(checkinPrepared, location.href, current)) { current.click(); checkinPrepared = CheckinState.prepare(current, location.href); }
       const submit = await waitForCheckinSubmit();
       if (!submit) { failRemote('submit-not-found'); status.textContent = '未找到站点签到按钮，未提交'; return; }
+      const latestState = DailyCheckinPage.getState();
+      const latestCurrent = DailyCheckinPage.findDefault();
+      const latestSignature = CheckinState.nodeSignature(latestCurrent);
+      if (latestState !== 'active' || !latestCurrent || latestSignature !== signature) {
+        failRemote('checkin-changed-or-unavailable');
+        status.textContent = '签到页面或默认选项已变化，未提交';
+        return;
+      }
       submit.click(); checkinActionKey = key; checkinPrepared = null; status.textContent = '已提交，等待签到结果（如有验证码请完成）';
       await waitForRemoteResult('checkin', remoteActionId, status);
     } catch { checkinActionKey = null; failRemote('action-failed'); status.textContent = '一键签到未完成，请重试或按站点提示手动操作'; }
@@ -510,17 +850,35 @@ const renderCheckin = () => {
   bar.append(oneClick, prepare, confirm);
 };
 let timer; let checkinTimer;
-const schedule = () => { clearTimeout(timer); timer = setTimeout(render, 180); };
+const schedule = () => { clearTimeout(timer); timer = setTimeout(() => { render().catch(() => {}); }, 180); };
 const scheduleCheckin = () => { clearTimeout(checkinTimer); checkinTimer = setTimeout(renderCheckin, 180); };
+const retryInitialQuestionRender = () => {
+  const startedAt = Date.now();
+  const retry = () => {
+    if (!isQuestionPage() || Date.now() - startedAt > QUESTION_READY_TIMEOUT_MS) return;
+    const state = DailyQuestionPage.getState();
+    const toolbar = getQuestionToolbar();
+    const hasAction = Boolean(toolbar?.querySelector?.('button'));
+    const waitingForQuestionDom = !toolbar || toolbar.textContent === '加载中或暂未识别到题目';
+    if (state === 'active' && !hasAction && waitingForQuestionDom) {
+      reportContentReady(true);
+      schedule();
+      setTimeout(retry, 300);
+    }
+  };
+  setTimeout(retry, 300);
+};
 if (isQuestionPage() || isCheckinPage()) {
-  chrome.runtime.sendMessage(ExtensionProtocol.createMessage(ExtensionProtocol.MESSAGE_TYPES.CONTENT_READY, { pageKind: detectPageKind() })).catch?.(() => {});
+  reportContentReady(true);
+  flushPendingRemoteResults().catch(() => {});
   new MutationObserver((records) => {
     const relevant = records.some((record) => !record.target.closest?.(`#${toolbarId}, #${checkinToolbarId}, #${checkinToastId}`));
     if (!relevant) return;
+    reportContentReady();
     if (isQuestionPage()) schedule();
     if (isCheckinPage()) scheduleCheckin();
   }).observe(document.body, { childList: true, subtree: true, characterData: true });
-  if (isQuestionPage()) schedule();
+  if (isQuestionPage()) { schedule(); retryInitialQuestionRender(); }
   if (isCheckinPage()) scheduleCheckin();
 }
 globalThis.Section1Bridge = bridge;

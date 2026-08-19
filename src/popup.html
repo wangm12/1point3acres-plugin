@@ -12,16 +12,62 @@
   <body>
     <main class="app" role="main" aria-labelledby="popup-title">
       <header class="header">
-        <p class="eyebrow">每日助手</p>
-        <h1 id="popup-title">一亩三分地每日助手</h1>
-        <p class="description">本地学习只保存在这台设备，不上传账号数据。</p>
+        <div class="header-content">
+          <h1 id="popup-title">一亩三分地助手</h1>
+          <span id="version-tag" class="version-tag">v0.2.0</span>
+        </div>
       </header>
 
-      <section class="actions" aria-label="快捷操作">
-        <button id="run-everything" type="button">一键签到&amp;打卡</button>
+      <!-- 异常受阻提示横幅（仅在遇到验证码/需登录/未收录等卡点时显示） -->
+      <section id="alert-banner" class="alert-banner" hidden aria-live="assertive">
+        <div class="alert-icon">⚠️</div>
+        <div class="alert-content">
+          <p id="alert-title" class="alert-title">任务需要人工处理</p>
+          <p id="alert-desc" class="alert-desc">检测到页面需要验证码或登录</p>
+        </div>
+        <button id="alert-action-btn" type="button" class="btn-alert">👉 前往处理</button>
       </section>
 
-      <p id="status" class="status" aria-live="polite"></p>
+      <!-- 核心操作区 -->
+      <section class="main-card">
+        <button id="run-everything" type="button" class="btn-primary">
+          <span class="btn-icon">🚀</span>
+          <span class="btn-text">一键签到 &amp; 答题</span>
+        </button>
+
+        <div class="sub-actions">
+          <button id="run-checkin" type="button" class="btn-secondary">
+            <span>📝</span> 单独签到
+          </button>
+          <button id="run-question" type="button" class="btn-secondary">
+            <span>💡</span> 单独答题
+          </button>
+        </div>
+      </section>
+
+      <!-- 今日任务状态面板 -->
+      <section class="status-card" aria-label="今日任务进度">
+        <div class="status-header">
+          <span class="status-label">今日进度</span>
+          <span id="overall-status-badge" class="badge">就绪</span>
+        </div>
+
+        <div class="task-grid">
+          <div class="task-item">
+            <div class="task-name">每日签到</div>
+            <div id="checkin-task-status" class="task-badge badge-pending">待完成</div>
+          </div>
+          <div class="task-item">
+            <div class="task-name">每日答题</div>
+            <div id="question-task-status" class="task-badge badge-pending">待完成</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 底部实时状态反馈 -->
+      <footer class="footer">
+        <p id="status-message" class="status-message" aria-live="polite">点击上方按钮一键自动完成今日任务</p>
+      </footer>
     </main>
   </body>
 </html>

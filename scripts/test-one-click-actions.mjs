@@ -13,7 +13,7 @@ const answerAction = source.slice(source.indexOf('const runQuestionAction'), sou
 assert.match(answerAction, /waitForStableQuestionSnapshot/);
 assert.match(answerAction, /const questionReadyTimeoutMs = actionId \? QUESTION_READY_TIMEOUT_MS : REMOTE_ACTION_TIMEOUT_MS/);
 assert.match(answerAction, /const lookupResponse = await bridge\.send\(ExtensionProtocol\.MESSAGE_TYPES\.LOOKUP_QUESTION/);
-assert.match(answerAction, /const actionKey = `\$\{snapshot\.question\}:\$\{lookupAnswerText\}`/);
+assert.match(answerAction, /const actionKey = `\$\{actionId \|\| 'local'\}:\$\{snapshot\.question\}:\$\{lookupAnswerText\}`/);
 assert.match(answerAction, /if \(actionKey === answerActionKey\) \{ failRemote\('duplicate-action'\); status\.textContent = '已一键答题，等待站点结果'; return; \}/);
 assert.match(answerAction, /const submitResult = await waitForQuestionSubmit\(snapshot\.question, lookupOptionTexts, lookupAnswerText\)/);
 assert.match(answerAction, /if \(!submitResult\.ok\) \{/);
@@ -48,7 +48,10 @@ assert.match(answerAction, /currentOptionText\.join\('\\u0001'\) !== lookupOptio
 assert.match(answerAction, /currentOptions\.filter\(\(node\) => DailyQuestionPage\.clean\(node\) === lookupAnswerText\)/, 'answer must match current option text, not cached index');
 assert.match(answerAction, /matching\.length !== 1/, 'answer must reject ambiguous target text');
 assert.match(question, /answerActionKey = null/);
-assert.match(question, /const result = \(await bridge\.send\(ExtensionProtocol\.MESSAGE_TYPES\.LOOKUP_QUESTION/);
+assert.match(question, /const result = lookupBudgetMs > 0[\s\S]*?lookupQuestionForRender\(question, options, Math\.min\(QUESTION_LOOKUP_RESPONSE_TIMEOUT_MS, lookupBudgetMs\)\)/);
+assert.match(source, /const lookupQuestionForRender = async/);
+assert.match(question, /正在读取本地答案…/);
+assert.match(question, /QUESTION_READY_TIMEOUT_MS - \(Date\.now\(\) - questionLookupRetryStartedAt\)/);
 assert.match(question, /!result \|\| result\.status === 'unmatched' \|\| result\.status === 'ambiguous'/);
 assert.match(question, /未找到已启用的官网提交按钮，未提交/);
 
@@ -61,6 +64,11 @@ const checkinSubmitClick = checkinAction.indexOf('submit.click()');
 assert(checkinOptionClick >= 0 && checkinSubmitLookup > checkinOptionClick && checkinSubmitClick > checkinSubmitLookup, 'checkin submit must be looked up after option preparation');
 assert.match(checkinAction, /if \(!submit\) \{ failRemote\('submit-not-found'\); status\.textContent = '未找到站点签到按钮，未提交'; return; \}/);
 assert.match(checkinAction, /if \(!CheckinState\.reconcile\(checkinPrepared, location\.href, current\)\) \{ current\.click\(\)/);
+assert.match(checkinAction, /const signature = CheckinState\.nodeSignature\(current\)/);
+assert.match(checkinAction, /const latestState = DailyCheckinPage\.getState\(\)/);
+assert.match(checkinAction, /const latestCurrent = DailyCheckinPage\.findDefault\(\)/);
+assert.match(checkinAction, /const latestSignature = CheckinState\.nodeSignature\(latestCurrent\)/);
+assert.match(checkinAction, /if \(latestState !== 'active' \|\| !latestCurrent \|\| latestSignature !== signature\) \{/);
 assert.match(checkinAction, /checkinActionKey = key/);
 assert.match(checkinAction, /catch \{ checkinActionKey = null;/, 'checkin failure must remain retryable');
 assert.doesNotMatch(checkinAction, /DailyCheckinPage\.nodeSignature/, 'checkin must use the shared state signature helper');
@@ -69,6 +77,11 @@ assert.doesNotMatch(source, /\? \/答对\|回答正确\//, 'question success mus
 assert.doesNotMatch(source, /获得奖励|奖励\.\*米/, 'success must not accept generic reward text');
 assert.match(source, /finishRemoteAction\(actionId, 'question', 'failed'/, 'question early returns must report failure');
 assert.match(source, /finishRemoteAction\(actionId, 'checkin', 'failed'/, 'checkin early returns must report failure');
+assert.match(source, /const pauseRemoteAction = \(actionId, action, reason\)/, 'login-blocked actions must be paused rather than terminally failed');
+assert.match(source, /reportContentReady\(true\)/, 'content must announce initial page state');
+assert.match(source, /const getContentReadySignature = \(\) => `\$\{detectPageKind\(\)\}:\$\{detectPageState\(\)\}`;/);
+assert.match(source, /lastReportedPageSignature/, 'content ready de-dupe must include page kind');
+assert.match(source, /reportContentReady\(\);[\s\S]*?if \(isQuestionPage\(\)\) schedule\(\);[\s\S]*?if \(isCheckinPage\(\)\) scheduleCheckin\(\);/, 'MutationObserver must report page-state transitions before rerender');
 assert.match(source, /finishRemoteAction\(actionId, action, 'success', 'completed'/, 'success must be reported from completed/explicit result wait');
 assert.match(source, /const checkinToastId = 'p3a-checkin-complete-toast'/);
 assert.match(source, /const showCheckinToast = \(message = '签到完成'\)/);
@@ -80,7 +93,7 @@ assert.match(source, /if \(!actionId\) \{[\s\S]*?if \(status === 'success'\) sho
 assert.match(checkinAction, /await waitForRemoteResult\('checkin', remoteActionId, status\)/, 'page one-click check-in must await the site result without a remote action id');
 const confirmAction = checkin.slice(checkin.indexOf("confirm.addEventListener('click'"));
 assert.match(confirmAction, /await waitForRemoteResult\('checkin', remoteActionId, status\)/, 'manual confirm check-in must await the site result');
-assert.match(source, /state === 'requires-login'[\s\S]*?finishRemoteAction\(actionId, action, 'failed'/, 'site failure must finish as failed');
+assert.match(source, /state === 'requires-login'[\s\S]*?pauseRemoteAction\(actionId, action, 'requires-login'\)/, 'requires-login must pause for recovery instead of terminal failure');
 const finish = source.slice(source.indexOf('const finishRemoteAction'), source.indexOf('const waitForRemoteResult'));
 assert.doesNotMatch(finish, /status === 'failed'[\s\S]*?showCheckinToast/, 'failed local actions must not show a success toast');
 

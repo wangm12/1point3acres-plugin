@@ -9,12 +9,15 @@ assert.match(source, /autoSelectedKey = questionKey;/, 'guard must be recorded b
 assert.match(source, /prepared = \{ questionKey, optionIndex: result\.optionIndex, node: target, answer: lookupAnswerText, optionTexts: lookupOptionTexts \};/, 'prepared must rebind to the live selected node');
 assert.match(source, /if \(selected === target && \(prepared\?\.questionKey === questionKey \|\| autoSelectedKey === questionKey\)\)/, 'node replacement must rebind only for the same question');
 assert.match(source, /const waitForStableQuestionSnapshot = async/, 'remote direct submission must wait for a stable snapshot');
+assert.match(source, /const QUESTION_READY_TIMEOUT_MS = 5000;/, 'remote question action must give a newly opened page a bounded five-second render window');
 assert.match(source, /const lookupResponse = await bridge\.send\(ExtensionProtocol\.MESSAGE_TYPES\.LOOKUP_QUESTION/, 'remote direct submission must re-query lookup at execution time');
 assert.match(source, /const target = matching\[0\];/, 'remote direct submission must use fresh current options');
 assert.match(source, /clickVisibleQuestionSubmit\(siteSubmit\)/, 'remote direct submission must click the live site submit button');
 assert.match(source, /clearAnswerMarks\(optionNodes\)/, 'non-match states must clear marks');
 assert.match(source, /result\.status === 'unmatched' \|\| result\.status === 'ambiguous'/, 'ambiguous and unmatched must not auto-select');
 assert.match(source, /result\.optionIndex < 0 \|\| result\.optionIndex >= optionNodes\.length/, 'invalid indexes must clear marks and stop');
+assert.match(source, /正在读取本地答案…/, 'initial answer lookup must expose a loading state');
+assert.match(source, /retryInitialQuestionRender/, 'initial question page must retry rendering while the site mounts');
 assert.doesNotMatch(source, /if \(autoSelectedKey !== questionKey[\s\S]{0,500}findSubmit\(\)/, 'auto path must not call site submit');
 assert.match(css, /p3a-answer-correct::after[\s\S]*content:\s*["']✓/);
 assert.match(css, /p3a-answer-incorrect::after[\s\S]*content:\s*["']✕/);

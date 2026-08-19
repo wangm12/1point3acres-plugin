@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <image href="1point3acres-favicon-base.png" x="0" y="0" width="48" height="48" preserveAspectRatio="xMidYMid meet"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M6 42 L23 24.6" stroke="#fff" stroke-width="7" opacity=".95"/>
+    <path d="M26.5 21.2 L42 5.5" stroke="#fff" stroke-width="7" opacity=".95"/>
+    <path d="M6 42 L23 24.6" stroke="#ef4444" stroke-width="4.4"/>
+    <path d="M26.5 21.2 L42 5.5" stroke="#ef4444" stroke-width="4.4"/>
+  </g>
+  <g transform="translate(30 30)">
+    <circle cx="9" cy="9" r="8.5" fill="#16a34a" stroke="#ffffff" stroke-width="2"/>
+    <path d="M5.2 9.2 L7.8 11.8 L13.2 6.4" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

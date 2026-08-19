@@ -22,6 +22,11 @@ const requiredPaths = [
   'assets/1point3acres-helper-icon-32.png',
   'assets/1point3acres-helper-icon-48.png',
   'assets/1point3acres-helper-icon-128.png',
+  'assets/1point3acres-helper-icon-enabled.svg',
+  'assets/1point3acres-helper-icon-enabled-16.png',
+  'assets/1point3acres-helper-icon-enabled-32.png',
+  'assets/1point3acres-helper-icon-enabled-48.png',
+  'assets/1point3acres-helper-icon-enabled-128.png',
   'src/service-worker.js',
   'src/popup.html',
   'src/popup.js',
@@ -48,9 +53,11 @@ for (const size of iconPaths) {
   assert(manifest.icons?.[size] === `assets/1point3acres-helper-icon-${size}.png`, `manifest icon ${size} mismatch`);
   assert(manifest.action?.default_icon?.[size] === manifest.icons[size], `action icon ${size} mismatch`);
 }
+assert(!JSON.stringify(manifest).includes('helper-icon-enabled'), 'manifest must not reference runtime-only enabled icons');
 assert(manifest.background?.service_worker === 'src/service-worker.js', 'background service worker path mismatch');
 assert(manifest.action?.default_popup === 'src/popup.html', 'popup path mismatch');
 assert(JSON.stringify(manifest.permissions ?? []) === JSON.stringify(['storage', 'notifications']), 'permissions must be exactly storage and notifications');
+assert(JSON.stringify(manifest.host_permissions ?? []) === JSON.stringify(['https://1point3acres.com/*', 'https://www.1point3acres.com/*']), 'host permissions must be limited to 1point3acres');
 
 const contentScripts = manifest.content_scripts ?? [];
 assert(contentScripts.length === 1, 'expected one content_scripts entry');
@@ -82,8 +89,14 @@ const expectedMessageTypes = [
   'SAVE_LEARNED_ANSWER',
   'LOOKUP_QUESTION',
   'RUN_ONE_CLICK',
+  'AUTO_SCHEDULE_GET',
+  'AUTO_SCHEDULE_ENABLE',
+  'AUTO_SCHEDULE_DISABLE',
+  'AUTO_SCHEDULE_STATE',
   'CONTENT_READY',
   'ACTION_RESULT',
+  'GET_RUNTIME_STATE',
+  'FOCUS_TASK_TAB',
 ];
 
 assert(

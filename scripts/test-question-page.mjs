@@ -5,27 +5,33 @@ import vm from 'node:vm';
 const source = fs.readFileSync(new URL('../src/shared/daily-question-page.js', import.meta.url), 'utf8');
 const assert = (value, message) => { if (!value) throw new Error(message); };
 const makeNode = (tag, value, { classes = '', attrs = {}, parent = null, disabled = false, children = [] } = {}) => {
-  const node = { tagName: tag.toUpperCase(), textContent: value, innerText: value, disabled, parentNode: parent, children, attrs, className: classes,
+  const node = { tagName: tag.toUpperCase(), textContent: value, innerText: value, disabled, parentNode: parent, children, attrs, className: classes, offsetParent: {},
     getAttribute(name) { return this.attrs[name] ?? null; },
     matches(selector) { return selector.includes('[class*="question"]') ? /question|text-orange|text-lg/i.test(this.className) : false; },
     closest(selector) { if (selector.includes('#p3a-daily-question-helper') && this.attrs.toolbar) return this; if (selector.includes('main')) { let n = this; while (n) { if (n.tagName === 'MAIN') return n; n = n.parentNode; } } return null; },
     querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
-    querySelectorAll(selector) { const all = []; const walk = (n) => { for (const child of n.children || []) { if ((selector.includes('button') && child.tagName === 'BUTTON') || (selector.includes('[role="option"]') && child.attrs.role === 'option')) all.push(child); if ((/(?:h1|h2|h3|heading|question|text-orange|text-lg)/.test(selector) || selector.includes('main p')) && ['H1','H2','H3','P','DIV','SPAN'].includes(child.tagName)) all.push(child); walk(child); } }; walk(this); return all; },
+    querySelectorAll(selector) { const all = []; const walk = (n) => { for (const child of n.children || []) { if ((selector.includes('button') && child.tagName === 'BUTTON') || (selector.includes('[role="option"]') && child.attrs.role === 'option')) all.push(child); if ((selector.includes('[data-question-container]') && child.attrs['data-question-container']) || (selector.includes('[data-question]') && child.attrs['data-question']) || (selector.includes('[class*="daily-question"]') && /daily-question/i.test(child.className)) || (selector.includes('[aria-label*="question" i]') && /question/i.test(child.attrs['aria-label'] || '')) || (selector.includes('[role="main"]') && child.attrs.role === 'main') || (selector.trim() === 'main' && child.tagName === 'MAIN')) all.push(child); if ((/(?:h1|h2|h3|heading|question|text-orange|text-lg)/.test(selector) || selector.includes('main p')) && ['H1','H2','H3','P','DIV','SPAN'].includes(child.tagName)) all.push(child); walk(child); } }; walk(this); return all; },
   };
   Object.defineProperty(node, 'parentElement', { get() { return this.parentNode?.tagName === 'DOCUMENT' ? null : this.parentNode; } });
   for (const child of children) child.parentNode = node;
   return node;
 };
 const main = makeNode('main', '', { children: [] });
+const outerMain = makeNode('main', '', { children: [] });
+const questionScope = makeNode('section', '', { attrs: { 'data-question-container': true }, children: [] });
 const question = makeNode('div', 'Which city is known as the Windy City?', { classes: 'text-orange text-lg question', children: [] });
 const optionNodes = ['Chicago', 'Boston', 'Seattle', 'Austin'].map((v) => makeNode('button', v, { classes: 'cursor-pointer rounded-md px-2.5 py-1.5 bg-gray-200 hover:bg-gray-300' }));
 optionNodes[0].className = 'cursor-pointer rounded-md px-2.5 py-1.5 bg-green-200 hover:bg-green-300';
 const submit = makeNode('button', '提交答案', { attrs: { type: 'submit' } });
 const nav = ['搜索', '返回旧版', '我的版块', '导航'].map((v) => makeNode('button', v));
-main.children.push(question, ...optionNodes, submit, ...nav);
+const sidebarQuestion = makeNode('aside', '今日已答题', { children: [] });
+questionScope.children.push(question, ...optionNodes, submit);
+for (const child of questionScope.children) child.parentNode = questionScope;
+main.children.push(questionScope, sidebarQuestion, ...nav);
 for (const child of main.children) child.parentNode = main;
+outerMain.children.push(main); main.parentNode = outerMain;
 const toolbar = makeNode('section', '每日答题助手', { attrs: { toolbar: true } });
-const body = makeNode('body', '', { children: [toolbar, main] });
+const body = makeNode('body', '', { children: [toolbar, outerMain] });
 const document = { body, querySelector: (selector) => document.querySelectorAll(selector)[0] || null, querySelectorAll: (selector) => body.querySelectorAll(selector) };
 const context = { globalThis: {}, document, location: { href: 'https://www.1point3acres.com/next/daily-question/' } };
 vm.runInNewContext(source, context);
@@ -56,11 +62,28 @@ optionNodes[1].attrs['aria-selected'] = 'true'; assert(page.findSelectedOption(d
 assert(page.getState({ body: { innerText: '请登录后答题' } }) === 'requires-login', 'login state failed');
 assert(page.getState({ body: { innerText: '请先登录后答题' } }) === 'requires-login', '请先登录 state failed');
 assert(page.getState({ body: { innerText: '关于论坛使用的题目：论坛规则是什么？' } }) === 'active', 'forum text must not be a status');
+assert(page.getState(document) === 'active', 'sidebar question noise must not flip state');
+questionScope.innerText = '';
+questionScope.textContent = '';
+outerMain.innerText = '今日已答题';
+outerMain.textContent = '今日已答题';
+assert(page.getState(document) === 'active', 'empty scoped question container must not fall back to body noise');
+outerMain.innerText = '';
+outerMain.textContent = '';
 question.textContent = '关于论坛使用的题目：论坛规则是什么？';
 optionNodes[0].textContent = '论坛用户需要遵守规则';
 assert(page.findQuestion(document).value === question.textContent, 'forum question was incorrectly filtered');
 assert(page.findOptions(document).some((node) => node.textContent === optionNodes[0].textContent), 'forum option was incorrectly filtered');
 assert(page.getState({ body: { innerText: '今日已答题' } }) === 'completed', 'completed state failed');
+assert(page.getState({ body: { innerText: '恭喜你答题成功! 获得奖励 大米 1 升' } }) === 'completed', 'site answer-success state failed');
+submit.disabled = true;
+submit.textContent = '今日已答题';
+questionScope.innerText = '今日已答题';
+questionScope.textContent = '今日已答题';
+assert(page.getState(document) === 'completed', 'disabled site 今日已答题 button must count as completed');
+submit.disabled = false;
+submit.textContent = '提交答案';
+assert(page.getState({ body: { innerText: '已经答过' } }) === 'completed', '已经答过 variant must count as completed');
 assert(fs.readFileSync(new URL('../src/content.js', import.meta.url), 'utf8').match(/getElementById\(toolbarId\)/g)?.length === 1, 'toolbar lookup should be centralized and reusable');
 const contentSource = fs.readFileSync(new URL('../src/content.js', import.meta.url), 'utf8');
 assert(contentSource.includes("result.status === 'unmatched' || result.status === 'ambiguous'"), 'unmatched/ambiguous branch must be handled');

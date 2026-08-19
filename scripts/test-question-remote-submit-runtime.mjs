@@ -5,12 +5,15 @@ import vm from 'node:vm';
 
 const source = fs
   .readFileSync(new URL('../src/content.js', import.meta.url), 'utf8')
-  .replace('const REMOTE_ACTION_TIMEOUT_MS = 8000;', 'const REMOTE_ACTION_TIMEOUT_MS = 80;')
-  .replace('const QUESTION_READY_TIMEOUT_MS = 3000;', 'const QUESTION_READY_TIMEOUT_MS = 30;')
+  .replace('const REMOTE_ACTION_TIMEOUT_MS = 5000;', 'const REMOTE_ACTION_TIMEOUT_MS = 80;')
+  .replace('const QUESTION_READY_TIMEOUT_MS = 5000;', 'const QUESTION_READY_TIMEOUT_MS = 30;')
   .replace('const REMOTE_ACTION_RETRY_MS = 200;', 'const REMOTE_ACTION_RETRY_MS = 1;')
   .replace('const REMOTE_RESULT_TIMEOUT_MS = 12000;', 'const REMOTE_RESULT_TIMEOUT_MS = 50;')
   .replace('const QUESTION_SUBMIT_WAIT_MS = 4000;', 'const QUESTION_SUBMIT_WAIT_MS = 50;')
-  .replace('const QUESTION_SUBMIT_POLL_MS = 100;', 'const QUESTION_SUBMIT_POLL_MS = 1;');
+  .replace('const QUESTION_SUBMIT_POLL_MS = 100;', 'const QUESTION_SUBMIT_POLL_MS = 1;')
+  .replace('const QUESTION_LOOKUP_RESPONSE_TIMEOUT_MS = 1500;', 'const QUESTION_LOOKUP_RESPONSE_TIMEOUT_MS = 10;')
+  .replace('const QUESTION_LOOKUP_RETRY_DELAY_MS = 250;', 'const QUESTION_LOOKUP_RETRY_DELAY_MS = 1;')
+  .replace('}, 180);', '}, 1);');
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const waitFor = async (check, { timeoutMs = 500, intervalMs = 1, message = 'condition not met' } = {}) => {
@@ -113,7 +116,7 @@ const makeElement = (tagName, text = '') => {
   return element;
 };
 
-const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity } = {}) => {
+const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, lookupTimeouts = 0 } = {}) => {
   const answerText = '这些都有';
   const main = makeElement('main');
   const questionNode = makeElement('div', questionText);
@@ -207,6 +210,7 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity } = {
         if (message.type === 'LOOKUP_QUESTION') {
           lookupCallCount += 1;
           if (renderLookupRequestedAt === null) renderLookupRequestedAt = Date.now();
+          if (lookupCallCount <= lookupTimeouts) return undefined;
           renderLookupResolvedAt = Date.now();
           return respond(lookupResponse);
         }
@@ -389,11 +393,23 @@ const notReadyResponse = new Promise((resolve) => {
 });
 await notReadyResponse.then((response) => assertResponse(response, 'not-ready remote command must be accepted'));
 await waitFor(() => notReady.actionResults.length >= 1, { message: 'not-ready question must report a failed ACTION_RESULT' });
-assert.equal(notReady.submitClicks, 0, 'question not ready within the 3-second window must not submit');
+assert.equal(notReady.submitClicks, 0, 'question not ready within the readiness window must not submit');
 assert.equal(notReady.actionResults[0]?.actionId, 'remote-3', 'question not ready should keep the original action id');
 assert.equal(notReady.actionResults[0]?.action, 'question', 'question not ready should report the question action');
 assert.equal(notReady.actionResults[0]?.status, 'failed', 'question not ready should report failure');
-assert.equal(notReady.actionResults[0]?.reason, 'question-not-ready', 'question not ready within the 3-second window should fail without submitting');
+assert.equal(notReady.actionResults[0]?.reason, 'question-not-ready', 'question not ready within the readiness window should fail without submitting');
+
+const delayedLookup = buildQuestionHarness({
+  questionText: '一亩三分地里有哪些方面的干货信息？',
+  changedAfterReads: Infinity,
+  lookupTimeouts: 1,
+});
+await waitFor(() => {
+  const toolbar = delayedLookup.document.getElementById('p3a-daily-question-helper');
+  return toolbar?.querySelectorAll('button').some((node) => node.textContent === '一键答题');
+}, { timeoutMs: 500, message: 'initial page render must retry a timed-out answer lookup' });
+assert(delayedLookup.lookupCallCount >= 2, 'initial page render must retry the background answer lookup');
+assert(delayedLookup.renderLookupResolvedAt !== null, 'a later answer lookup must recover the initial render');
 
 const noCallbackHarness = buildQuestionHarness({ questionText: '一亩三分地里有哪些方面的干货信息？', changedAfterReads: Infinity });
 const noCallbackResult = noCallbackHarness.chrome.runtime.sendMessage({ type: 'CONTENT_READY' });

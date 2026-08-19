@@ -160,6 +160,10 @@ const buildCompletedCheckinHarness = () => {
             });
             return Promise.resolve(undefined);
           }
+          if (actionResultCalls === 2) {
+            asyncCallback(callback, { ok: true, accepted: false, actionId: 'mismatch-action' });
+            return Promise.resolve({ ok: true, accepted: false, actionId: 'mismatch-action' });
+          }
           asyncCallback(callback, { ok: true });
           return Promise.resolve({ ok: true });
         }
@@ -265,6 +269,8 @@ await waitFor(() => harness.actionResultCalls === 1, { message: 'initial ACTION_
 assert.equal(harness.actionResultCalls, 1, 'completed checkin should attempt to report ACTION_RESULT once immediately');
 assert.equal(harness.defaultClicks, 0, 'already-completed checkin must not click the mood option');
 assert.equal(harness.submitClicks, 0, 'already-completed checkin must not click submit');
+await waitFor(() => harness.actionResultCalls === 3, { timeoutMs: 1200, message: 'accepted:false should keep pending ACTION_RESULT until a matching ACK arrives' });
+assert.equal(harness.actionResultCalls, 3, 'mismatched ACK must not clear pending remote result');
 
 const duplicateResponse = await new Promise((resolve) => {
   harness.runtimeListener(

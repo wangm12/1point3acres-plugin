@@ -1,93 +1,286 @@
 :root {
   color-scheme: light dark;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: Canvas;
   color: CanvasText;
 }
 
-html,
-body {
+html, body {
   margin: 0;
   min-width: 320px;
 }
 
 body {
-  padding: 14px;
+  padding: 12px;
 }
 
 .app {
   display: grid;
-  gap: 16px;
-  padding: 16px;
-  border: 1px solid color-mix(in srgb, CanvasText 14%, Canvas);
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, CanvasText 12%, Canvas);
   border-radius: 16px;
-  background: color-mix(in srgb, Canvas 94%, CanvasText 6%);
-  box-shadow: 0 10px 30px color-mix(in srgb, CanvasText 12%, transparent);
+  background: color-mix(in srgb, Canvas 95%, CanvasText 5%);
+  box-shadow: 0 8px 24px color-mix(in srgb, CanvasText 10%, transparent);
 }
 
 .header {
-  display: grid;
-  gap: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 
-.eyebrow {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  opacity: 0.7;
+.header-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
 }
 
 h1 {
   margin: 0;
-  font-size: 20px;
-  line-height: 1.2;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
 }
 
-.description {
+.version-tag {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: color-mix(in srgb, CanvasText 8%, Canvas);
+  opacity: 0.7;
+}
+
+/* 异常受阻提示横幅 */
+.alert-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: color-mix(in srgb, #f59e0b 16%, Canvas);
+  border: 1px solid color-mix(in srgb, #f59e0b 40%, transparent);
+  animation: slide-in 0.2s ease-out;
+}
+
+.alert-banner[hidden] {
+  display: none !important;
+}
+
+.alert-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.alert-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.alert-title {
   margin: 0;
-  font-size: 13px;
-  line-height: 1.45;
-  opacity: 0.82;
+  font-size: 12px;
+  font-weight: 700;
+  color: color-mix(in srgb, #d97706 90%, CanvasText);
 }
 
-.actions {
+.alert-desc {
+  margin: 2px 0 0;
+  font-size: 11px;
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btn-alert {
+  flex-shrink: 0;
+  appearance: none;
+  border: none;
+  background: #d97706;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(217, 119, 6, 0.3);
+  transition: transform 0.1s, opacity 0.1s;
+}
+
+.btn-alert:hover {
+  opacity: 0.9;
+  transform: translateY(-1px);
+}
+
+/* 主操作卡片 */
+.main-card {
   display: grid;
   gap: 8px;
 }
 
-button {
+.btn-primary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   appearance: none;
-  border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas);
+  width: 100%;
+  border: none;
   border-radius: 12px;
-  background: color-mix(in srgb, Canvas 92%, CanvasText 8%);
-  color: inherit;
-  padding: 10px 12px;
-  font: inherit;
-  font-weight: 600;
-  text-align: left;
+  background: linear-gradient(135deg, #f97316 0%, #ea580c 100%);
+  color: #ffffff;
+  padding: 12px 16px;
+  font-size: 15px;
+  font-weight: 700;
   cursor: pointer;
-  min-height: 44px;
+  box-shadow: 0 4px 12px rgba(234, 88, 12, 0.35);
+  transition: transform 0.1s, box-shadow 0.1s, opacity 0.1s;
 }
 
-button:hover {
-  background: color-mix(in srgb, Canvas 86%, CanvasText 14%);
+.btn-primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(234, 88, 12, 0.45);
 }
 
-button:focus-visible {
-  outline: 2px solid Highlight;
-  outline-offset: 2px;
+.btn-primary:active:not(:disabled) {
+  transform: translateY(0);
 }
 
-button:disabled {
+.btn-primary:disabled {
+  opacity: 0.6;
   cursor: not-allowed;
-  opacity: 0.55;
+  transform: none;
 }
 
-.status {
-  margin: 0;
-  min-height: 1.4em;
+.btn-icon {
+  font-size: 16px;
+}
+
+.sub-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.btn-secondary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  appearance: none;
+  border: 1px solid color-mix(in srgb, CanvasText 14%, Canvas);
+  border-radius: 10px;
+  background: color-mix(in srgb, Canvas 90%, CanvasText 10%);
+  color: inherit;
+  padding: 8px 10px;
   font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: color-mix(in srgb, Canvas 82%, CanvasText 18%);
+}
+
+.btn-secondary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* 状态面板 */
+.status-card {
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, CanvasText 10%, Canvas);
+  background: color-mix(in srgb, Canvas 98%, CanvasText 2%);
+}
+
+.status-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.status-label {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.7;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: color-mix(in srgb, CanvasText 10%, Canvas);
+}
+
+.task-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.task-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, CanvasText 4%, Canvas);
+}
+
+.task-name {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.task-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+
+.badge-pending {
+  background: color-mix(in srgb, CanvasText 10%, Canvas);
   opacity: 0.75;
 }
+
+.badge-running {
+  background: color-mix(in srgb, #3b82f6 20%, Canvas);
+  color: #3b82f6;
+}
+
+.badge-done {
+  background: color-mix(in srgb, #10b981 20%, Canvas);
+  color: #059669;
+}
+
+.badge-error {
+  background: color-mix(in srgb, #ef4444 20%, Canvas);
+  color: #dc2626;
+}
+
+/* 底部状态 */
+.footer {
+  text-align: center;
+}
+
+.status-message {
+  margin: 0;
+  font-size: 11px;
+  opacity: 0.75;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+

@@ -26,6 +26,10 @@
     "storage",
     "notifications"
   ],
+  "host_permissions": [
+    "https://1point3acres.com/*",
+    "https://www.1point3acres.com/*"
+  ],
   "content_scripts": [
     {
       "matches": [

@@ -10,30 +10,68 @@ const protocolSource = read('../src/shared/protocol.js');
 const questionMatcherSource = read('../src/shared/question-matcher.js');
 const learnedAnswersSource = read('../src/shared/learned-answers.js');
 
-const makeHarness = ({ store, tabs = [], sendMessageMode = {} }) => {
-  const events = [];
-  const listeners = { message: null, updated: null };
-  let nextTabId = Math.max(0, ...tabs.map((tab) => tab.id || 0)) + 1;
+const getLosAngelesDateKey = (date = new Date()) => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const year = parts.find((part) => part.type === 'year')?.value;
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
+  return `${year}-${month}-${day}`;
+};
+const todayDateKey = getLosAngelesDateKey();
+const nextDayDateKey = (() => {
+  const [year, month, day] = todayDateKey.split('-').map(Number);
+  const utc = new Date(Date.UTC(year, month - 1, day));
+  utc.setUTCDate(utc.getUTCDate() + 1);
+  return utc.toISOString().slice(0, 10);
+})();
 
+const runtimeKey = 'p3a-runtime-v1';
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+const baseRun = (overrides = {}) => ({
+  runId: null,
+  laDateKey: null,
+  source: null,
+  stage: null,
+  status: 'idle',
+  transition: null,
+  lease: null,
+  attempt: 0,
+  currentTabId: null,
+  originActiveTabId: null,
+  currentActionId: null,
+  lastError: null,
+  events: [],
+  ...overrides,
+});
+
+const makeHarness = ({ store, tabs = [], sendMessageMode = {}, removeMode = {}, getMode = {} }) => {
+  const events = [];
+  const listeners = { message: null, updated: null, startup: null, installed: null };
+  let nextTabId = Math.max(0, ...tabs.map((tab) => tab.id || 0)) + 1;
   const tabMap = new Map(tabs.map((tab) => [tab.id, { ...tab }]));
-  const sessionStore = store.session;
-  const localStore = store.local;
+  const getCounts = new Map();
 
   const chrome = {
     runtime: {
       getURL: (p) => p,
-      onMessage: {
-        addListener: (fn) => { listeners.message = fn; },
-      },
+      onMessage: { addListener: (fn) => { listeners.message = fn; } },
+      onStartup: { addListener: (fn) => { listeners.startup = fn; } },
+      onInstalled: { addListener: (fn) => { listeners.installed = fn; } },
     },
     storage: {
       session: {
-        get: async (key) => ({ [key]: sessionStore[key] }),
-        set: async (value) => { Object.assign(sessionStore, value); events.push(['storage.session.set', JSON.parse(JSON.stringify(value))]); },
+        get: async (key) => ({ [key]: store.session[key] }),
+        set: async (value) => { Object.assign(store.session, value); events.push(['storage.session.set', JSON.parse(JSON.stringify(value))]); },
       },
       local: {
-        get: async (key) => ({ [key]: localStore[key] }),
-        set: async (value) => { Object.assign(localStore, value); },
+        get: async (key) => ({ [key]: store.local[key] }),
+        set: async (value) => { Object.assign(store.local, value); },
       },
     },
     tabs: {
@@ -48,16 +86,25 @@ const makeHarness = ({ store, tabs = [], sendMessageMode = {} }) => {
         const tab = tabMap.get(tabId);
         if (!tab) throw new Error('missing-tab');
         Object.assign(tab, changes);
+        if (changes.active === true) {
+          for (const other of tabMap.values()) if (other.id !== tabId) other.active = false;
+        }
         events.push(['tabs.update', tabId, { ...changes }]);
         return { ...tab };
       },
       remove: async (tabId) => {
         events.push(['tabs.remove', tabId]);
+        const mode = removeMode[tabId] ?? removeMode.default ?? 'ok';
+        if (mode === 'throw') throw new Error('remove-failed');
         tabMap.delete(tabId);
       },
       get: async (tabId) => {
         const tab = tabMap.get(tabId);
         if (!tab) throw new Error('missing-tab');
+        const mode = getMode[tabId] ?? getMode.default ?? 'mirror';
+        const count = (getCounts.get(tabId) || 0) + 1;
+        getCounts.set(tabId, count);
+        if (typeof mode === 'function') return mode(tabId, { ...tab }, count, tabMap);
         return { ...tab };
       },
       sendMessage: async (tabId, message) => {
@@ -65,16 +112,11 @@ const makeHarness = ({ store, tabs = [], sendMessageMode = {} }) => {
         const mode = sendMessageMode[tabId] ?? sendMessageMode.default ?? 'ack';
         if (mode === 'throw') throw new Error('sendMessage-failed');
         if (mode === 'noack') return null;
-        if (typeof mode === 'function') return mode(tabId, message);
         return { ok: true, accepted: true, actionId: message.payload.actionId };
       },
-      onUpdated: {
-        addListener: (fn) => { listeners.updated = fn; },
-      },
+      onUpdated: { addListener: (fn) => { listeners.updated = fn; } },
     },
-    notifications: {
-      create: async (opts) => { events.push(['notifications.create', opts]); return 'n1'; },
-    },
+    notifications: { create: async (opts) => { events.push(['notifications.create', opts]); return 'n1'; } },
   };
 
   const context = {
@@ -86,7 +128,9 @@ const makeHarness = ({ store, tabs = [], sendMessageMode = {} }) => {
   };
   context.globalThis = context;
   context.importScripts = (...files) => files.forEach((file) => {
-    const source = file === 'shared/protocol.js' ? protocolSource : file === 'shared/question-matcher.js' ? questionMatcherSource : learnedAnswersSource;
+    const source = file === 'shared/protocol.js' ? protocolSource
+      : file === 'shared/question-matcher.js' ? questionMatcherSource
+      : learnedAnswersSource;
     vm.runInContext(source, context);
   });
   vm.createContext(context);
@@ -96,291 +140,248 @@ const makeHarness = ({ store, tabs = [], sendMessageMode = {} }) => {
     events.push(['sendResponse', type, response]);
     resolve(response);
   }));
-  const triggerUpdated = (tabId, changeInfo, tab) => listeners.updated?.(tabId, changeInfo, tab);
 
-  return { chrome, events, sessionStore, localStore, send, triggerUpdated, tabMap };
+  return { events, send, listeners, tabMap, store, chrome };
 };
 
-const runtimeKey = 'p3a-runtime-v1';
-const flush = () => new Promise((resolve) => setImmediate(resolve));
+const runStore = (session = {}, local = { 'p3a-learned-answers-v1': [] }) => ({ session, local });
 
 {
-  const store = { session: {}, local: { 'p3a-learned-answers-v1': [] } };
-  const harness1 = makeHarness({
-    store,
-    sendMessageMode: { default: 'throw' },
-  });
-
-  const open1 = await harness1.send('RUN_ONE_CLICK', { action: 'checkin' });
-  assert.equal(open1.ok, true);
-  const tabId = open1.payload.tabId;
-  const runtimeAfterOpen = store.session[runtimeKey];
-  const checkinAction = runtimeAfterOpen.actionsByTabId[String(tabId)];
-  assert.equal(checkinAction.action, 'checkin');
-  assert.equal(checkinAction.status, 'pending');
-  assert.equal(runtimeAfterOpen.awaitingContentByTabId[String(tabId)].actionId, checkinAction.actionId);
-
-  await harness1.send('CONTENT_READY', {}, { tab: { id: tabId } });
+  const store = runStore();
+  const harness = makeHarness({ store, tabs: [{ id: 11, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }] });
+  const [first, second] = await Promise.all([
+    harness.send('RUN_ONE_CLICK', { action: 'everything' }),
+    harness.send('RUN_ONE_CLICK', { action: 'everything' }),
+  ]);
   await flush();
-  assert.equal(store.session[runtimeKey].actionsByTabId[String(tabId)].lastDeliveryError, 'sendMessage-failed');
-  assert.equal(store.session[runtimeKey].awaitingContentByTabId[String(tabId)].actionId, checkinAction.actionId);
-
-  const harness2 = makeHarness({
-    store,
-    tabs: [{ id: tabId, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }],
-  });
-  await harness2.send('CONTENT_READY', {}, { tab: { id: tabId } });
-  await flush();
-  assert.equal(store.session[runtimeKey].actionsByTabId[String(tabId)].deliveredAt > 0, true);
-  assert.equal(store.session[runtimeKey].awaitingContentByTabId[String(tabId)], undefined);
-  assert.deepEqual(harness2.events.filter((e) => e[0] === 'tabs.sendMessage').length, 1);
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(first.payload.runId, second.payload.runId);
+  assert.equal(harness.events.filter((e) => (e[0] === 'tabs.create' || e[0] === 'tabs.update') && String(e[1]?.url ?? e[2]?.url ?? '').includes('/daily-checkin')).length, 1);
 }
 
 {
-  const store = {
-    session: {
-      [runtimeKey]: {
-        version: 1,
-        actionsByTabId: {},
-        awaitingContentByTabId: {},
-        pendingActionsById: {
-          'pending-1': {
-            action: 'checkin',
-            actionId: 'pending-1',
-            workflowId: null,
-            tabId: null,
-            status: 'pending',
-            deliveredAt: null,
-            deliveredCount: 0,
-            lastDeliveryAttemptAt: null,
-            lastDeliveryError: null,
-            lastResult: null,
-          },
-        },
-        workflowsById: {},
-        activeWorkflowId: null,
-      },
-    },
-    local: { 'p3a-learned-answers-v1': [] },
-  };
-  const harness = makeHarness({
-    store,
-    tabs: [{ id: 41, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }],
-  });
-  await harness.send('CONTENT_READY', {}, { tab: { id: 41 } });
-  await flush();
-  assert.equal(store.session[runtimeKey].actionsByTabId['41'].actionId, 'pending-1');
-  assert.equal(store.session[runtimeKey].actionsByTabId['41'].deliveredAt > 0, true);
-}
-
-{
-  const store = { session: {}, local: { 'p3a-learned-answers-v1': [] } };
-  const harness = makeHarness({
-    store,
-    tabs: [{ id: 11, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }],
-  });
+  const store = runStore();
+  const harness = makeHarness({ store, tabs: [{ id: 21, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }] });
   const open = await harness.send('RUN_ONE_CLICK', { action: 'everything' });
-  assert.equal(open.ok, true);
-  const checkinTabId = open.payload.tabId;
-  const runtime = store.session[runtimeKey];
-  const workflowId = open.payload.workflowId;
-  const checkinAction = runtime.actionsByTabId[String(checkinTabId)];
-  assert.equal(checkinAction.workflowId, workflowId);
-
-  const resultResp = await harness.send('ACTION_RESULT', { actionId: checkinAction.actionId, action: 'checkin', status: 'success' }, { tab: { id: checkinTabId } });
   await flush();
-  assert.equal(resultResp.ok, true);
-  const eventNames = harness.events.map((e) => e[0]);
-  assert.ok(eventNames.indexOf('sendResponse') < eventNames.indexOf('tabs.remove'));
-  assert.ok(eventNames.indexOf('tabs.remove') > eventNames.indexOf('notifications.create'));
-  assert.equal(store.session[runtimeKey].workflowsById[workflowId].stage, 'question');
+  const checkinTabId = open.payload.tabId;
+  const runId = open.payload.runId;
+  const runtime = store.session[runtimeKey];
+  const checkinAction = runtime.actionsByTabId[String(checkinTabId)];
+  assert.equal(runtime.run.runId, runId);
+  assert.equal(runtime.run.stage, 'checkin');
+  assert.equal(runtime.run.currentActionId, checkinAction.actionId);
+  assert.equal(checkinAction.workflowId, null);
+  const result = await harness.send('ACTION_RESULT', { actionId: checkinAction.actionId, action: 'checkin', status: 'success' }, { tab: { id: checkinTabId } });
+  await flush();
+  assert.equal(result.ok, true);
+  assert.equal(store.session[runtimeKey].run.stage, 'question');
+  assert.equal(store.session[runtimeKey].run.runId, runId);
   const questionTabId = harness.events.find((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question'))[1].id;
   const questionAction = store.session[runtimeKey].actionsByTabId[String(questionTabId)];
   assert.equal(questionAction.action, 'question');
-  assert.equal(questionAction.status, 'pending');
-  assert.equal(harness.tabMap.has(checkinTabId), false);
-
-  const questionActionId = store.session[runtimeKey].actionsByTabId[String(questionTabId)].actionId;
-  const questionResp = await harness.send('ACTION_RESULT', { actionId: questionActionId, action: 'question', status: 'success' }, { tab: { id: questionTabId } });
+  assert.equal(questionAction.workflowId, null);
+  assert.notEqual(questionAction.actionId, checkinAction.actionId);
+  const questionResp = await harness.send('ACTION_RESULT', { actionId: questionAction.actionId, action: 'question', status: 'success' }, { tab: { id: questionTabId } });
   await flush();
   assert.equal(questionResp.ok, true);
-  assert.equal(store.session[runtimeKey].workflowsById[workflowId], undefined);
-  assert.equal(store.session[runtimeKey].activeWorkflowId, null);
+  assert.equal(store.session[runtimeKey].run.runId, null);
+  assert.equal(store.session[runtimeKey].run.stage, null);
+  assert.equal(store.session[runtimeKey].run.currentActionId, null);
   assert.equal(store.session[runtimeKey].actionsByTabId[String(questionTabId)], undefined);
-  assert.equal(store.session[runtimeKey].pendingActionsById[questionActionId], undefined);
-  assert.equal(harness.tabMap.has(questionTabId), false);
-
-  const duplicateCountBefore = harness.events.length;
-  const duplicate = await harness.send('ACTION_RESULT', { actionId: questionActionId, action: 'question', status: 'success' }, { tab: { id: questionTabId } });
-  await flush();
-  assert.equal(duplicate.ok, false);
-  assert.equal(duplicate.error, 'unknown-action-id');
-  assert.equal(harness.events.length, duplicateCountBefore + 1);
 }
 
 {
-  const store = { session: {}, local: { 'p3a-learned-answers-v1': [] } };
-  const harness = makeHarness({
-    store,
-    tabs: [{ id: 21, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }],
-  });
-  const open = await harness.send('RUN_ONE_CLICK', { action: 'everything' });
-  const checkinTabId = open.payload.tabId;
-  const checkinActionId = store.session[runtimeKey].actionsByTabId[String(checkinTabId)].actionId;
-
-  const failed = await harness.send('ACTION_RESULT', { actionId: checkinActionId, action: 'checkin', status: 'failed' }, { tab: { id: checkinTabId } });
-  await flush();
-  assert.equal(failed.ok, true);
-  assert.equal(harness.tabMap.has(checkinTabId), true);
-  assert.equal(store.session[runtimeKey].workflowsById[open.payload.workflowId], undefined);
-
-  const timeoutHarness = makeHarness({
-    store: { session: {}, local: { 'p3a-learned-answers-v1': [] } },
-    tabs: [{ id: 31, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }],
-  });
-  const opened = await timeoutHarness.send('RUN_ONE_CLICK', { action: 'checkin' });
-  const timeoutTabId = opened.payload.tabId;
-  const timeoutActionId = timeoutHarness.sessionStore[runtimeKey].actionsByTabId[String(timeoutTabId)].actionId;
-  await timeoutHarness.send('ACTION_RESULT', { actionId: timeoutActionId, action: 'checkin', status: 'timeout' }, { tab: { id: timeoutTabId } });
-  await flush();
-  assert.equal(timeoutHarness.tabMap.has(timeoutTabId), true);
-}
-
-{
-  const store = {
-    session: {
-      [runtimeKey]: {
-        version: 1,
-        actionsByTabId: {
-          '51': {
-            action: 'checkin',
-            actionId: 'checkin-51',
-            workflowId: 'workflow-51',
-            tabId: 51,
-            status: 'completed',
-            deliveredAt: 1,
-            deliveredCount: 1,
-            lastDeliveryAttemptAt: 1,
-            lastDeliveryError: null,
-            lastResult: { action: 'checkin', status: 'success', reason: 'already-completed' },
-          },
-        },
-        awaitingContentByTabId: {},
-        pendingActionsById: {},
-        workflowsById: {
-          'workflow-51': {
-            action: 'everything',
-            stage: 'checkin',
-            createdAt: 1,
-            updatedAt: 1,
-            tabIds: [51],
-            checkinActionId: 'checkin-51',
-            questionActionId: null,
-          },
-        },
-        activeWorkflowId: 'workflow-51',
-      },
+  const store = runStore({
+    [runtimeKey]: {
+      version: 1,
+      run: baseRun({ runId: 'run-q', laDateKey: todayDateKey, stage: 'question', status: 'running', currentTabId: 72, currentActionId: 'q-72' }),
+      actionsByTabId: { '72': { action: 'question', actionId: 'q-72', workflowId: null, tabId: 72, createdByExtension: true, status: 'completed', deliveredAt: 1, deliveredCount: 1, lastDeliveryAttemptAt: 1, lastDeliveryError: null, lastResult: { action: 'question', status: 'success' }, finalizationPending: true } },
+      awaitingContentByTabId: {},
+      pendingActionsById: {},
+      workflowsById: {},
+      activeWorkflowId: null,
     },
-    local: { 'p3a-learned-answers-v1': [] },
-  };
-  const harness = makeHarness({
-    store,
-    tabs: [{ id: 51, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }],
   });
-  const response = await harness.send('RUN_ONE_CLICK', { action: 'everything' });
-  await flush();
-  assert.equal(response.ok, true, 'completed checkin workflow should resume instead of failing');
-  assert.equal(store.session[runtimeKey].workflowsById['workflow-51'].stage, 'question');
-  const questionCreate = harness.events.find((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question'));
-  assert.ok(questionCreate, 'question tab should open after completed checkin');
-  assert.equal(store.session[runtimeKey].actionsByTabId[String(questionCreate[1].id)].action, 'question');
-  const createCountBeforeDuplicate = harness.events.filter((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question')).length;
-  const duplicate = await harness.send('ACTION_RESULT', { actionId: 'checkin-51', action: 'checkin', status: 'success', reason: 'already-completed' }, { tab: { id: 51 } });
-  await flush();
-  assert.equal(duplicate.ok, true, 'duplicate completed ACTION_RESULT should be accepted for recovery');
-  assert.equal(duplicate.duplicate, true, 'duplicate completed ACTION_RESULT should be marked duplicate');
-  assert.equal(harness.events.filter((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question')).length, createCountBeforeDuplicate, 'duplicate recovery must not create another question tab');
+  const harness = makeHarness({ store, tabs: [{ id: 72, url: 'https://www.1point3acres.com/next/daily-question', active: false }] });
+  await harness.listeners.startup?.();
+  await flush(); await flush();
+  assert.equal(harness.tabMap.has(72), false);
+  assert.equal(store.session[runtimeKey].actionsByTabId['72'], undefined);
+  assert.equal(store.session[runtimeKey].run.status, 'idle');
 }
 
 {
-  const store = {
-    session: {
-      [runtimeKey]: {
-        version: 1,
-        actionsByTabId: {
-          '61': {
-            action: 'checkin',
-            actionId: 'checkin-61',
-            workflowId: 'workflow-61',
-            tabId: 61,
-            status: 'pending',
-            deliveredAt: null,
-            deliveredCount: 0,
-            lastDeliveryAttemptAt: null,
-            lastDeliveryError: null,
-            lastResult: null,
-          },
-        },
-        awaitingContentByTabId: {
-          '61': {
-            action: 'checkin',
-            actionId: 'checkin-61',
-            workflowId: 'workflow-61',
-            tabId: 61,
-            status: 'pending',
-            deliveredAt: null,
-            deliveredCount: 0,
-            lastDeliveryAttemptAt: null,
-            lastDeliveryError: null,
-            lastResult: null,
-          },
-        },
-        pendingActionsById: {
-          'checkin-61': {
-            action: 'checkin',
-            actionId: 'checkin-61',
-            workflowId: 'workflow-61',
-            tabId: 61,
-            status: 'pending',
-            deliveredAt: null,
-            deliveredCount: 0,
-            lastDeliveryAttemptAt: null,
-            lastDeliveryError: null,
-            lastResult: null,
-          },
-        },
-        workflowsById: {
-          'workflow-61': {
-            action: 'everything',
-            stage: 'checkin',
-            createdAt: 1,
-            updatedAt: 1,
-            tabIds: [61],
-            checkinActionId: 'checkin-61',
-            questionActionId: null,
-          },
-        },
-        activeWorkflowId: 'workflow-61',
-      },
+  const store = runStore({
+    [runtimeKey]: {
+      version: 1,
+      run: baseRun({ runId: 'run-q2', laDateKey: todayDateKey, stage: 'question', status: 'running', currentTabId: 73, currentActionId: 'q-73' }),
+      actionsByTabId: { '73': { action: 'question', actionId: 'q-73', workflowId: null, tabId: 73, createdByExtension: true, status: 'completed', deliveredAt: 1, deliveredCount: 1, lastDeliveryAttemptAt: 1, lastDeliveryError: null, lastResult: { action: 'question', status: 'success' }, finalizationPending: true } },
+      awaitingContentByTabId: {},
+      pendingActionsById: {},
+      workflowsById: {},
+      activeWorkflowId: null,
     },
-    local: { 'p3a-learned-answers-v1': [] },
-  };
-  const harness = makeHarness({
-    store,
-    tabs: [{ id: 61, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }],
   });
-  const response = await harness.send('RUN_ONE_CLICK', { action: 'everything' });
+  const harness = makeHarness({ store, tabs: [{ id: 73, url: 'https://www.1point3acres.com/next/daily-question', active: false }], removeMode: { 73: 'throw' } });
+  await harness.listeners.startup?.();
   await flush();
-  assert.equal(response.ok, true, 'pending checkin workflow should resume instead of failing');
+  assert.equal(harness.tabMap.has(73), true);
+  assert.equal(store.session[runtimeKey].actionsByTabId['73'].finalizationPending, true);
+  assert.equal(store.session[runtimeKey].run.status, 'paused');
+  assert.equal(store.session[runtimeKey].run.lastError, 'remove-failed');
+}
+
+{
+  const store = runStore({
+    [runtimeKey]: {
+      version: 1,
+      run: baseRun({ runId: 'run-active', laDateKey: todayDateKey, stage: 'question', status: 'running', currentTabId: 74, currentActionId: 'q-74' }),
+      actionsByTabId: { '74': { action: 'question', actionId: 'q-74', workflowId: null, tabId: 74, createdByExtension: true, status: 'completed', deliveredAt: 1, deliveredCount: 1, lastDeliveryAttemptAt: 1, lastDeliveryError: null, lastResult: { action: 'question', status: 'success' }, finalizationPending: true } },
+      awaitingContentByTabId: {},
+      pendingActionsById: {},
+      workflowsById: {},
+      activeWorkflowId: null,
+    },
+  });
+  const harness = makeHarness({ store, tabs: [{ id: 74, url: 'https://www.1point3acres.com/next/daily-question', active: true }, { id: 274, url: 'https://example.com', active: false }] });
+  await harness.listeners.startup?.();
+  await flush();
+  assert.equal(harness.tabMap.has(74), false);
+  assert.equal(harness.events.some((e) => e[0] === 'tabs.remove' && e[1] === 74), true);
+  assert.equal(harness.events.some((e) => e[0] === 'tabs.update' && e[1] === 274), false);
+  assert.equal(store.session[runtimeKey].actionsByTabId['74'], undefined);
+  assert.equal(store.session[runtimeKey].run.status, 'idle');
+}
+
+{
+  const store = runStore({
+    [runtimeKey]: {
+      version: 1,
+      run: baseRun({ runId: 'run-c', laDateKey: todayDateKey, stage: 'checkin', status: 'running', currentTabId: 101, currentActionId: 'checkin-101' }),
+      actionsByTabId: { '101': { action: 'checkin', actionId: 'checkin-101', workflowId: null, tabId: 101, createdByExtension: true, status: 'completed', deliveredAt: 1, deliveredCount: 1, lastDeliveryAttemptAt: 1, lastDeliveryError: null, lastResult: { action: 'checkin', status: 'success' }, finalizationPending: true } },
+      awaitingContentByTabId: {},
+      pendingActionsById: {},
+      workflowsById: {},
+      activeWorkflowId: null,
+    },
+  });
+  const harness = makeHarness({ store, tabs: [{ id: 101, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }] });
+  await harness.listeners.startup?.();
+  await flush();
+  assert.equal(harness.tabMap.has(101), false);
+  const recoveredQuestion = harness.events.find((event) => event[0] === 'tabs.create' && event[1].url.includes('/daily-question'));
+  assert.ok(recoveredQuestion, 'a completed checkin recovered at startup must continue to daily question');
+  assert.equal(store.session[runtimeKey].run.status, 'running');
+  assert.equal(store.session[runtimeKey].run.stage, 'question');
+  assert.equal(store.session[runtimeKey].run.currentTabId, recoveredQuestion[1].id);
+}
+
+{
+  const store = runStore({
+    [runtimeKey]: {
+      version: 1,
+      run: baseRun({ runId: 'run-c2', laDateKey: todayDateKey, stage: 'checkin', status: 'running', currentTabId: 102, currentActionId: 'checkin-102' }),
+      actionsByTabId: { '102': { action: 'checkin', actionId: 'checkin-102', workflowId: null, tabId: 102, createdByExtension: true, status: 'completed', deliveredAt: 1, deliveredCount: 1, lastDeliveryAttemptAt: 1, lastDeliveryError: null, lastResult: { action: 'checkin', status: 'success' }, finalizationPending: true } },
+      awaitingContentByTabId: {},
+      pendingActionsById: {},
+      workflowsById: {},
+      activeWorkflowId: null,
+    },
+  });
+  const harness = makeHarness({ store, tabs: [{ id: 102, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }, { id: 202, url: 'https://www.1point3acres.com/next/daily-question', active: false }] });
+  await harness.listeners.startup?.();
+  await flush();
+  assert.equal(harness.tabMap.has(102), false);
+  assert.equal(harness.tabMap.has(202), false);
+  assert.equal(harness.events.filter((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question')).length, 1, 'recovery must replace stale question pages with one managed question tab');
+  assert.equal(store.session[runtimeKey].run.stage, 'question');
+}
+
+{
+  const store = runStore({
+    [runtimeKey]: {
+      version: 1,
+      run: baseRun({ runId: 'run-m', laDateKey: todayDateKey, stage: 'question', status: 'running', currentTabId: 103, currentActionId: 'checkin-103' }),
+      actionsByTabId: { '103': { action: 'checkin', actionId: 'checkin-103', workflowId: null, tabId: 103, createdByExtension: true, status: 'completed', deliveredAt: 1, deliveredCount: 1, lastDeliveryAttemptAt: 1, lastDeliveryError: null, lastResult: { action: 'checkin', status: 'success' }, finalizationPending: true } },
+      awaitingContentByTabId: {},
+      pendingActionsById: {},
+      workflowsById: {},
+      activeWorkflowId: null,
+    },
+  });
+  const harness = makeHarness({ store, tabs: [] });
+  await harness.listeners.startup?.();
+  await flush();
+  assert.equal(harness.events.some((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question')), true);
+}
+
+{
+  const store = runStore({
+    [runtimeKey]: {
+      version: 1,
+      run: baseRun({ runId: 'run-ack', laDateKey: todayDateKey, stage: 'checkin', status: 'running', currentTabId: 41, currentActionId: 'pending-1' }),
+      actionsByTabId: { '41': { action: 'checkin', actionId: 'pending-1', workflowId: null, tabId: 41, status: 'pending', deliveredAt: null, deliveredCount: 0, lastDeliveryAttemptAt: null, lastDeliveryError: null, lastResult: null } },
+      awaitingContentByTabId: { '41': { action: 'checkin', actionId: 'pending-1', workflowId: null, tabId: 41, status: 'pending', deliveredAt: null, deliveredCount: 0, lastDeliveryAttemptAt: null, lastDeliveryError: null, lastDeliveryError: null, lastResult: null } },
+      pendingActionsById: { 'pending-1': { action: 'checkin', actionId: 'pending-1', workflowId: null, tabId: 41, status: 'pending', deliveredAt: null, deliveredCount: 0, lastDeliveryAttemptAt: null, lastDeliveryError: null, lastResult: null } },
+      workflowsById: {},
+      activeWorkflowId: null,
+    },
+  });
+  const harness = makeHarness({ store, tabs: [{ id: 41, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }] });
+  await harness.send('CONTENT_READY', { pageState: 'ready' }, { tab: { id: 41 } });
+  await flush();
+  assert.equal(store.session[runtimeKey].actionsByTabId['41'].deliveredAt > 0, true);
+  assert.equal(store.session[runtimeKey].awaitingContentByTabId['41'].actionId, 'pending-1');
+}
+
+{
+  const store = runStore();
+  const harness = makeHarness({ store, tabs: [{ id: 51, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }] });
+  const open = await harness.send('RUN_ONE_CLICK', { action: 'checkin' });
+  await flush();
+  const tabId = open.payload.tabId;
+  const actionId = store.session[runtimeKey].actionsByTabId[String(tabId)].actionId;
+  const resp = await harness.send('ACTION_RESULT', { actionId, action: 'checkin', status: 'success' }, { tab: { id: tabId } });
+  await flush();
+  assert.equal(resp.ok, true);
+  assert.equal(store.session[runtimeKey].run.stage, 'question');
+  const qTabId = harness.events.find((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question'))[1].id;
+  const qActionId = store.session[runtimeKey].actionsByTabId[String(qTabId)].actionId;
+  const dup = await harness.send('ACTION_RESULT', { actionId: qActionId, action: 'question', status: 'success' }, { tab: { id: qTabId } });
+  await flush();
+  assert.equal(dup.ok, true);
+  assert.equal(dup.accepted, true);
+}
+
+{
+  const store = runStore({
+    [runtimeKey]: {
+      version: 1,
+      run: baseRun(),
+      actionsByTabId: {
+        '71': { action: 'question', actionId: 'question-71', workflowId: 'workflow-71', tabId: 71, status: 'completed', deliveredAt: 1, deliveredCount: 1, lastDeliveryAttemptAt: 1, lastDeliveryError: null, lastResult: { action: 'question', status: 'success' }, finalizationPending: true },
+      },
+      awaitingContentByTabId: {},
+      pendingActionsById: {
+        'question-71': { action: 'question', actionId: 'question-71', workflowId: 'workflow-71', tabId: 71, status: 'completed', deliveredAt: 1, deliveredCount: 1, lastDeliveryAttemptAt: 1, lastDeliveryError: null, lastResult: { action: 'question', status: 'success' }, finalizationPending: true },
+      },
+      workflowsById: { 'workflow-71': { action: 'everything', stage: 'question', createdAt: 1, updatedAt: 1, tabIds: [71], checkinActionId: 'checkin-71', questionActionId: 'question-71' } },
+      activeWorkflowId: 'workflow-71',
+    },
+  });
+  const harness = makeHarness({ store, tabs: [{ id: 71, url: 'https://www.1point3acres.com/next/daily-question', active: false }, { id: 171, url: 'https://www.1point3acres.com/next/daily-question', active: true }] });
+  await harness.listeners.startup?.();
+  await flush();
+  assert.equal(harness.tabMap.has(71), false);
+  assert.equal(harness.tabMap.has(171), true);
+  assert.equal(store.session[runtimeKey].actionsByTabId['71'].finalizationPending, true);
   assert.equal(harness.events.filter((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question')).length, 0);
-  const checkinTabId = response.payload.tabId;
-  const checkinActionId = store.session[runtimeKey].actionsByTabId[String(checkinTabId)].actionId;
-  const result = await harness.send('ACTION_RESULT', { actionId: checkinActionId, action: 'checkin', status: 'success' }, { tab: { id: checkinTabId } });
-  await flush();
-  assert.equal(result.ok, true);
-  assert.equal(harness.events.filter((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question')).length, 1);
-  const questionActions = Object.values(store.session[runtimeKey].actionsByTabId).filter((record) => record?.action === 'question');
-  assert.equal(questionActions.length, 1);
 }
+
+
+
+
 
 console.log('service worker recovery tests passed.');

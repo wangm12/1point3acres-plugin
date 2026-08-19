@@ -5,14 +5,17 @@ import vm from 'node:vm';
 
 const source = fs
   .readFileSync(new URL('../src/content.js', import.meta.url), 'utf8')
-  .replace('const REMOTE_ACTION_TIMEOUT_MS = 8000;', 'const REMOTE_ACTION_TIMEOUT_MS = 80;')
+  .replace('const REMOTE_ACTION_TIMEOUT_MS = 5000;', 'const REMOTE_ACTION_TIMEOUT_MS = 80;')
   .replace('const REMOTE_ACTION_RETRY_MS = 200;', 'const REMOTE_ACTION_RETRY_MS = 1;')
-  .replace('const REMOTE_RESULT_TIMEOUT_MS = 12000;', 'const REMOTE_RESULT_TIMEOUT_MS = 80;')
+  .replace('const REMOTE_RESULT_TIMEOUT_MS = 12000;', 'const REMOTE_RESULT_TIMEOUT_MS = 2000;')
   .replace('const REMOTE_RESULT_REPORT_DELAY_MS = 200;', 'const REMOTE_RESULT_REPORT_DELAY_MS = 1;')
   .replace('const QUESTION_SUBMIT_WAIT_MS = 4000;', 'const QUESTION_SUBMIT_WAIT_MS = 50;')
   .replace('const QUESTION_SUBMIT_POLL_MS = 100;', 'const QUESTION_SUBMIT_POLL_MS = 1;');
 
 const delay = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+const asyncCallback = (callback, response) => {
+  if (typeof callback === 'function') queueMicrotask(() => callback(response));
+};
 const waitFor = async (check, { timeoutMs = 500, intervalMs = 1, message = 'condition not met' } = {}) => {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -33,6 +36,7 @@ const makeElement = (tagName, text = '') => {
     isConnected: true,
     hidden: false,
     className: '',
+    shadowRoot: null,
     children: [],
     parentNode: null,
     attributes: Object.create(null),
@@ -83,14 +87,16 @@ const makeElement = (tagName, text = '') => {
       }
     },
     closest(selector) {
-      if (selector === 'main') {
-        let current = element;
-        while (current) {
-          if (current.tagName === 'MAIN') return current;
-          current = current.parentNode;
+      const selectors = String(selector || '').split(',').map((part) => part.trim()).filter(Boolean);
+      let current = element;
+      while (current) {
+        for (const part of selectors) {
+          if (part === 'main' && current.tagName === 'MAIN') return current;
+          if (part === 'form' && current.tagName === 'FORM') return current;
+          if (part.startsWith('#') && current.id === part.slice(1)) return current;
         }
+        current = current.parentNode;
       }
-      if (selector.includes('#p3a-daily-question-helper') && element.id === 'p3a-daily-question-helper') return element;
       return null;
     },
     querySelector(selector) {
@@ -101,7 +107,18 @@ const makeElement = (tagName, text = '') => {
       const walk = (node) => {
         for (const child of node.children || []) {
           if (selector.includes('button') && child.tagName === 'BUTTON') found.push(child);
+          if (selector.includes('input') && child.tagName === 'INPUT') found.push(child);
+          if (selector.includes('textarea') && child.tagName === 'TEXTAREA') found.push(child);
+          if (selector.includes('img') && child.tagName === 'IMG') found.push(child);
+          if (selector.includes('iframe') && child.tagName === 'IFRAME') found.push(child);
+          if (selector.includes('canvas') && child.tagName === 'CANVAS') found.push(child);
           if (selector.includes('[role="option"]') && child.getAttribute('role') === 'option') found.push(child);
+          if (selector.includes('[class*="captcha"]') && /captcha/i.test(String(child.className || ''))) found.push(child);
+          if (selector.includes('[id*="captcha"]') && /captcha/i.test(String(child.id || ''))) found.push(child);
+          if (selector.includes('[name*="captcha"]') && /captcha/i.test(String(child.getAttribute?.('name') || ''))) found.push(child);
+          if (selector.includes('[placeholder*="验证码"]') && /验证码/.test(String(child.getAttribute?.('placeholder') || ''))) found.push(child);
+          if (selector.includes('[placeholder*="captcha" i]') && /captcha/i.test(String(child.getAttribute?.('placeholder') || ''))) found.push(child);
+          if (selector.includes('[aria-label*="captcha" i]') && /captcha/i.test(String(child.getAttribute?.('aria-label') || ''))) found.push(child);
           if (selector.includes('main') && child.tagName === 'MAIN') found.push(child);
           walk(child);
         }
@@ -176,10 +193,6 @@ const buildCheckinHarness = () => {
     querySelectorAll: (selector) => body.querySelectorAll(selector),
   };
 
-  const asyncCallback = (callback, response) => {
-    if (typeof callback === 'function') queueMicrotask(() => callback(response));
-  };
-
   const chrome = {
     runtime: {
       lastError: null,
@@ -188,6 +201,8 @@ const buildCheckinHarness = () => {
         if (message.type === 'ACTION_RESULT') {
           actionResultCalls += 1;
           actionResults.push(message.payload);
+          asyncCallback(callback, { ok: true, accepted: true, actionId: message.payload?.actionId });
+          return Promise.resolve({ ok: true, accepted: true, actionId: message.payload?.actionId });
         }
         asyncCallback(callback, { ok: true });
         return Promise.resolve({ ok: true });
@@ -289,7 +304,7 @@ const buildCheckinHarness = () => {
   };
 };
 
-const buildQuestionHarness = ({ completionText }) => {
+const buildQuestionHarness = ({ completionText, noiseText = '' }) => {
   let runtimeListener = null;
   let actionResultCalls = 0;
   const actionResults = [];
@@ -322,8 +337,14 @@ const buildQuestionHarness = ({ completionText }) => {
   submitButton.click = () => {
     submitClicks += 1;
     queueMicrotask(() => {
-      body.innerText = completionText;
-      body.textContent = completionText;
+      if (completionText != null) {
+        main.innerText = completionText;
+        main.textContent = completionText;
+      }
+      if (noiseText) {
+        body.innerText = noiseText;
+        body.textContent = noiseText;
+      }
     });
   };
 
@@ -348,10 +369,6 @@ const buildQuestionHarness = ({ completionText }) => {
     querySelectorAll: (selector) => body.querySelectorAll(selector),
   };
 
-  const asyncCallback = (callback, response) => {
-    if (typeof callback === 'function') queueMicrotask(() => callback(response));
-  };
-
   const chrome = {
     runtime: {
       lastError: null,
@@ -360,8 +377,8 @@ const buildQuestionHarness = ({ completionText }) => {
         if (message.type === 'ACTION_RESULT') {
           actionResultCalls += 1;
           actionResults.push(message.payload);
-          asyncCallback(callback, { ok: true });
-          return Promise.resolve({ ok: true });
+          asyncCallback(callback, { ok: true, accepted: true, actionId: message.payload?.actionId });
+          return Promise.resolve({ ok: true, accepted: true, actionId: message.payload?.actionId });
         }
         if (message.type === 'LOOKUP_QUESTION') {
           asyncCallback(callback, { ok: true, payload: { status: 'matched', optionIndex: 2, answerText } });
@@ -525,5 +542,333 @@ assert.deepEqual(toPlain(questionDoneHarness.actionResults), [{
   pageKind: 'daily-question',
   url: 'https://www.1point3acres.com/next/daily-question',
 }], '今日已答题 should be treated as a completed remote question result');
+
+const questionNoiseHarness = buildQuestionHarness({ completionText: '论坛正文仍然是题目内容', noiseText: '页面其他区域提示：今日已答题，获得大米' });
+assert.equal(typeof questionNoiseHarness.runtimeListener, 'function', 'content script must register a runtime listener for noise regression');
+const questionNoiseResponse = await new Promise((resolve) => {
+  questionNoiseHarness.runtimeListener(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'question-noise-1' } },
+    {},
+    resolve,
+  );
+});
+assertRemoteAccepted(questionNoiseResponse, 'noise regression command must be accepted');
+await delay(350);
+assert.equal(questionNoiseHarness.submitClicks, 1, 'noise text must not trigger an extra submit');
+assert.equal(questionNoiseHarness.actionResults.some((result) => result.status === 'success' && result.reason === 'completed'), false, 'unrelated body success text must not be treated as completion');
+
+const buildCaptchaHarness = ({ actionId, captchaText = '请输入验证码后继续签到', decorate }) => {
+  const body = makeElement('body');
+  const outerMain = makeElement('main');
+  const captchaMain = makeElement('main');
+  body.appendChild(outerMain);
+  outerMain.appendChild(captchaMain);
+  outerMain.innerText = '页面侧栏提示：今日已签到，验证码规则说明';
+  outerMain.textContent = outerMain.innerText;
+  captchaMain.innerText = captchaText;
+  captchaMain.textContent = captchaText;
+  const submit = makeElement('button', '提交签到');
+  submit.click = () => {};
+  const defaultMood = makeElement('button', '没心情');
+  captchaMain.appendChild(submit);
+  captchaMain.appendChild(defaultMood);
+  const noise = makeElement('aside', '今日已答题');
+  outerMain.appendChild(noise);
+  if (typeof decorate === 'function') decorate({ body, outerMain, captchaMain, submit, defaultMood });
+
+  let runtimeListener = null;
+  const actionResults = [];
+  const context = {
+    globalThis: {},
+    document: {
+      body,
+      createElement: (tag) => makeElement(tag),
+      getElementById: () => null,
+      querySelector: (selector) => body.querySelector(selector),
+      querySelectorAll: (selector) => body.querySelectorAll(selector),
+    },
+    chrome: {
+      runtime: {
+        lastError: null,
+        onMessage: { addListener(fn) { runtimeListener = fn; } },
+        sendMessage(message, callback) {
+          if (message.type === 'ACTION_RESULT') {
+            actionResults.push(message.payload);
+            asyncCallback(callback, { ok: true, accepted: true, actionId: message.payload?.actionId });
+            return Promise.resolve({ ok: true, accepted: true, actionId: message.payload?.actionId });
+          }
+          asyncCallback(callback, { ok: true });
+          return Promise.resolve({ ok: true });
+        },
+      },
+    },
+    location: { href: 'https://www.1point3acres.com/next/daily-checkin' },
+    window: null,
+    ExtensionProtocol: {
+      MESSAGE_TYPES: {
+        RUN_ONE_CLICK: 'RUN_ONE_CLICK',
+        LOOKUP_QUESTION: 'LOOKUP_QUESTION',
+        CONTENT_READY: 'CONTENT_READY',
+        ACTION_RESULT: 'ACTION_RESULT',
+        SAVE_LEARNED_ANSWER: 'SAVE_LEARNED_ANSWER',
+      },
+      createMessage(type, payload) { return { type, payload }; },
+    },
+    DailyQuestionPage: {
+      TOOLBAR_ID: 'p3a-daily-question-helper',
+      isQuestionPage: () => false,
+      findQuestionContainer: () => null,
+      findQuestion: () => ({ node: null, value: '' }),
+      findOptions: () => [],
+      findSelectedOption: () => null,
+      findSubmit: () => null,
+      clean: (node) => String(node?.textContent || '').trim(),
+      getState: () => 'active',
+    },
+    DailyCheckinPage: {
+      TOOLBAR_ID: 'p3a-daily-checkin-helper',
+      isCheckinPage: () => true,
+      findDefault: () => defaultMood,
+      findSubmit: () => submit,
+      getState: () => 'active',
+      nodeSignature: () => '',
+    },
+    CheckinState: { reconcile: () => null, prepare: () => null, nodeSignature: () => '' },
+    QuestionMatcher: { normalize: (value) => String(value || '').trim() },
+    MutationObserver: class { constructor() {} observe() {} disconnect() {} },
+    MouseEvent: class {},
+    Date,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    queueMicrotask,
+    console,
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.runInNewContext(source, context);
+  return { actionId, runtimeListener, actionResults };
+};
+
+const runCaptchaScenario = async (name, options) => {
+  const harness = buildCaptchaHarness({ actionId: `checkin-captcha-${name}`, ...options });
+  const response = await new Promise((resolve) => {
+    harness.runtimeListener(
+      { type: 'RUN_ONE_CLICK', payload: { action: 'checkin', actionId: harness.actionId } },
+      {},
+      resolve,
+    );
+  });
+  assertRemoteAccepted(response, `${name} captcha command must be accepted`);
+  await waitFor(() => harness.actionResults.some((result) => result.reason === 'captcha-required'), { timeoutMs: 1200, message: `${name} captcha prompt should report captcha-required` });
+  assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-required' && result.status === 'failed'), true, `${name} captcha-required must be reported as failed`);
+};
+
+await runCaptchaScenario('input', {
+  decorate: ({ captchaMain }) => {
+    const input = makeElement('input');
+    input.setAttribute('placeholder', '请输入验证码');
+    captchaMain.appendChild(input);
+  },
+});
+
+await runCaptchaScenario('iframe', {
+  decorate: ({ captchaMain }) => {
+    const iframe = makeElement('iframe');
+    iframe.setAttribute('title', 'captcha challenge');
+    captchaMain.appendChild(iframe);
+  },
+});
+
+await runCaptchaScenario('image', {
+  decorate: ({ captchaMain }) => {
+    const image = makeElement('img');
+    image.setAttribute('alt', '验证码图片');
+    image.setAttribute('src', 'https://example.test/captcha.png');
+    captchaMain.appendChild(image);
+  },
+});
+
+await runCaptchaScenario('widget', {
+  captchaText: '请完成安全验证后继续签到',
+  decorate: ({ captchaMain }) => {
+    const widget = makeElement('div');
+    widget.className = 'geetest-container';
+    widget.setAttribute('data-widget', 'captcha');
+    captchaMain.appendChild(widget);
+  },
+});
+
+await runCaptchaScenario('shadow-dom', {
+  captchaText: '请完成人机验证后继续签到',
+  decorate: ({ captchaMain }) => {
+    const host = makeElement('div');
+    host.setAttribute('data-widget', 'verification');
+    host.shadowRoot = {
+      children: [makeElement('iframe')],
+      querySelector(selector) {
+        return selector === '*' ? this.children[0] : null;
+      },
+    };
+    captchaMain.appendChild(host);
+  },
+});
+
+await runCaptchaScenario('success-text-with-captcha-input', {
+  captchaText: '签到成功，请输入验证码完成验证',
+  decorate: ({ captchaMain }) => {
+    const input = makeElement('input');
+    input.setAttribute('placeholder', '请输入验证码');
+    captchaMain.appendChild(input);
+  },
+});
+
+await runCaptchaScenario('success-text-with-captcha-widget', {
+  captchaText: '今日已签到，请完成安全验证',
+  decorate: ({ captchaMain }) => {
+    const widget = makeElement('div');
+    widget.className = 'captcha-widget';
+    widget.setAttribute('data-widget', 'captcha');
+    captchaMain.appendChild(widget);
+  },
+});
+
+const buildFlushHarness = ({ href, storedResults, windowName = 'p3a-test-tab' }) => {
+  let runtimeListener = null;
+  const actionResults = [];
+  const store = { 'p3a-pending-remote-results-v1': toPlain(storedResults) };
+  const chrome = {
+    storage: {
+      local: {
+        get: async (key) => ({ [key]: store[key] }),
+        set: async (value) => { Object.assign(store, value); },
+      },
+    },
+    runtime: {
+      lastError: null,
+      onMessage: { addListener(fn) { runtimeListener = fn; } },
+      sendMessage(message, callback) {
+        if (message.type === 'ACTION_RESULT') actionResults.push(message.payload);
+        asyncCallback(callback, { ok: true, accepted: true, actionId: message.payload?.actionId });
+        return Promise.resolve({ ok: true, accepted: true, actionId: message.payload?.actionId });
+      },
+    },
+  };
+  const context = {
+    globalThis: {},
+    document: {
+      body: makeElement('body'),
+      createElement: (tag) => makeElement(tag),
+      getElementById: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    },
+    chrome,
+    location: { href },
+    window: null,
+    ExtensionProtocol: {
+      MESSAGE_TYPES: {
+        RUN_ONE_CLICK: 'RUN_ONE_CLICK',
+        LOOKUP_QUESTION: 'LOOKUP_QUESTION',
+        CONTENT_READY: 'CONTENT_READY',
+        ACTION_RESULT: 'ACTION_RESULT',
+        SAVE_LEARNED_ANSWER: 'SAVE_LEARNED_ANSWER',
+      },
+      createMessage(type, payload) { return { type, payload }; },
+    },
+    DailyQuestionPage: {
+      TOOLBAR_ID: 'p3a-daily-question-helper',
+      isQuestionPage: (url) => String(url || '').includes('/next/daily-question'),
+      findQuestionContainer: () => null,
+      findQuestion: () => ({ node: null, value: '' }),
+      findOptions: () => [],
+      findSelectedOption: () => null,
+      findSubmit: () => null,
+      clean: (node) => String(node?.textContent || '').trim(),
+      getState: () => 'active',
+    },
+    DailyCheckinPage: {
+      TOOLBAR_ID: 'p3a-daily-checkin-helper',
+      isCheckinPage: (url) => String(url || '').includes('/next/daily-checkin'),
+      findDefault: () => null,
+      findSubmit: () => null,
+      getState: () => 'active',
+      nodeSignature: () => '',
+    },
+    CheckinState: { reconcile: () => null, prepare: () => null, nodeSignature: () => '' },
+    QuestionMatcher: { normalize: (value) => String(value || '').trim() },
+    MutationObserver: class { constructor() {} observe() {} disconnect() {} },
+    MouseEvent: class {},
+    Date,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    queueMicrotask,
+    console,
+  };
+  context.window = context;
+  context.globalThis = context;
+  context.window.name = windowName;
+  vm.runInNewContext(source, context);
+  return { runtimeListener, actionResults, store };
+};
+
+const sharedTabName = 'p3a-tab-p3a-test-tab';
+const questionRecord = {
+  actionId: 'flushQuestion',
+  action: 'question',
+  status: 'success',
+  reason: 'completed',
+  pageKind: 'daily-question',
+  taskUrl: 'https://www.1point3acres.com/next/daily-question',
+  tabIdentity: sharedTabName,
+  url: 'https://www.1point3acres.com/next/daily-question',
+};
+const checkinRecord = {
+  actionId: 'flushCheckin',
+  action: 'checkin',
+  status: 'success',
+  reason: 'completed',
+  pageKind: 'daily-checkin',
+  taskUrl: 'https://www.1point3acres.com/next/daily-checkin',
+  tabIdentity: sharedTabName,
+  url: 'https://www.1point3acres.com/next/daily-checkin',
+};
+
+const wrongPageQuestionHarness = buildFlushHarness({
+  href: 'https://www.1point3acres.com/next/daily-checkin',
+  windowName: sharedTabName,
+  storedResults: { flushQuestion: questionRecord },
+});
+assert.equal(typeof wrongPageQuestionHarness.runtimeListener, 'function', 'content script must register on check-in page');
+assert.deepEqual(toPlain(wrongPageQuestionHarness.actionResults), [], 'question result must not flush on check-in page');
+assert.deepEqual(toPlain(wrongPageQuestionHarness.store['p3a-pending-remote-results-v1']), { flushQuestion: questionRecord }, 'question result must be preserved for the matching page');
+
+const wrongPageCheckinHarness = buildFlushHarness({
+  href: 'https://www.1point3acres.com/next/daily-question',
+  windowName: sharedTabName,
+  storedResults: { flushCheckin: checkinRecord },
+});
+assert.equal(typeof wrongPageCheckinHarness.runtimeListener, 'function', 'content script must register on question page');
+assert.deepEqual(toPlain(wrongPageCheckinHarness.actionResults), [], 'check-in result must not flush on question page');
+assert.deepEqual(toPlain(wrongPageCheckinHarness.store['p3a-pending-remote-results-v1']), { flushCheckin: checkinRecord }, 'check-in result must be preserved for the matching page');
+
+const samePageHarness = buildFlushHarness({
+  href: 'https://www.1point3acres.com/next/daily-checkin',
+  windowName: sharedTabName,
+  storedResults: { flushCheckin: checkinRecord },
+});
+await waitFor(() => samePageHarness.actionResults.length === 1, { timeoutMs: 1200, message: 'matching check-in result should flush once' });
+assert.deepEqual(toPlain(samePageHarness.actionResults), [{
+  actionId: 'flushCheckin',
+  action: 'checkin',
+  status: 'success',
+  reason: 'completed',
+  pageKind: 'daily-checkin',
+  url: 'https://www.1point3acres.com/next/daily-checkin',
+}], 'matching check-in result should ACK once');
+assert.deepEqual(toPlain(samePageHarness.store['p3a-pending-remote-results-v1']), {}, 'matching check-in result should be cleared after ACK');
 
 console.log('checkin/question dynamic completion signal regression tests passed.');
