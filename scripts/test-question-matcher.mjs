@@ -60,6 +60,18 @@ const tiedBank = [
 const ambiguousFuzzy = lookup('一亩三分地每日签到选项', ['选项一', '选项二'], tiedBank);
 assert(ambiguousFuzzy.status === 'ambiguous' && ambiguousFuzzy.matchType === 'fuzzy', 'ambiguous fuzzy match failed');
 
+// Test exact question with options differing only by punctuation/symbols
+const codeSyntaxOptions = [
+  '[hide]想要隐藏的内容[/hide]',
+  '[hide=200]想要隐藏的内容[/hide]',
+  '[hide=200 ]想要隐藏的内容[/hide]',
+  '[hide=200]想要隐藏的内容[hide]'
+];
+const codeSyntaxResult = lookup('地里发帖可以隐藏内容。假如要设置200积分以上才可以看到，下面哪个语法正确？', codeSyntaxOptions, hideBank);
+assert(codeSyntaxResult.status === 'matched', 'code syntax options should match without false ambiguity');
+assert(codeSyntaxResult.matchType === 'exact', 'should be exact match');
+assert(codeSyntaxResult.optionIndex === 1, 'should match option 1 strictly');
+
 assert(contentSource.includes("document.getElementById(toolbarId)") && contentSource.includes("if (!bar)"), 'toolbar must be reused instead of duplicated');
 assert(contentSource.includes('button.closest(`#${toolbarId}`)'), 'toolbar buttons must be excluded from page option scan');
 assert(contentSource.includes("/提交答案|提交|确认答案/"), 'submit button selector must be separate from options');

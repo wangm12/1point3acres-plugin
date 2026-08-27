@@ -7,10 +7,12 @@ const source = fs
   .readFileSync(new URL('../src/content.js', import.meta.url), 'utf8')
   .replace('const REMOTE_ACTION_TIMEOUT_MS = 5000;', 'const REMOTE_ACTION_TIMEOUT_MS = 80;')
   .replace('const REMOTE_ACTION_RETRY_MS = 200;', 'const REMOTE_ACTION_RETRY_MS = 1;')
-  .replace('const REMOTE_RESULT_TIMEOUT_MS = 12000;', 'const REMOTE_RESULT_TIMEOUT_MS = 2000;')
+  .replace('const REMOTE_RESULT_TIMEOUT_MS = 16000;', 'const REMOTE_RESULT_TIMEOUT_MS = 2000;')
+  .replace('const CAPTCHA_GRACE_PERIOD_MS = 10000;', 'const CAPTCHA_GRACE_PERIOD_MS = 20;')
   .replace('const REMOTE_RESULT_REPORT_DELAY_MS = 200;', 'const REMOTE_RESULT_REPORT_DELAY_MS = 1;')
   .replace('const QUESTION_SUBMIT_WAIT_MS = 4000;', 'const QUESTION_SUBMIT_WAIT_MS = 50;')
-  .replace('const QUESTION_SUBMIT_POLL_MS = 100;', 'const QUESTION_SUBMIT_POLL_MS = 1;');
+  .replace('const QUESTION_SUBMIT_POLL_MS = 100;', 'const QUESTION_SUBMIT_POLL_MS = 1;')
+  .replace('}, 200);', '}, 1);');
 
 const delay = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 const asyncCallback = (callback, response) => {
@@ -733,6 +735,58 @@ await runCaptchaScenario('success-text-with-captcha-widget', {
     captchaMain.appendChild(widget);
   },
 });
+
+// Explicit error fast-path
+{
+  const harness = buildCaptchaHarness({
+    actionId: 'checkin-captcha-explicit-error',
+    captchaText: '安全验证失败，请重试',
+  });
+  const response = await new Promise((resolve) => {
+    harness.runtimeListener(
+      { type: 'RUN_ONE_CLICK', payload: { action: 'checkin', actionId: harness.actionId } },
+      {},
+      resolve,
+    );
+  });
+  assertRemoteAccepted(response, 'explicit error command must be accepted');
+  await waitFor(() => harness.actionResults.some((result) => result.reason === 'captcha-error'), { timeoutMs: 1200, message: 'explicit error should immediately report captcha-error' });
+  assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-error' && result.status === 'failed'), true);
+}
+
+// Auto-resolving Cloudflare Turnstile during grace period
+{
+  let targetIframe = null;
+  let targetMain = null;
+  const harness = buildCaptchaHarness({
+    actionId: 'checkin-cloudflare-autoresolve',
+    captchaText: '安全验证中',
+    decorate: ({ captchaMain }) => {
+      targetMain = captchaMain;
+      targetIframe = makeElement('iframe');
+      targetIframe.setAttribute('src', 'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv0/0/m0fkl/0x4AAAAAAADnPIDROrmt1Wwj/light/normal');
+      captchaMain.appendChild(targetIframe);
+    },
+  });
+  const response = await new Promise((resolve) => {
+    harness.runtimeListener(
+      { type: 'RUN_ONE_CLICK', payload: { action: 'checkin', actionId: harness.actionId } },
+      {},
+      resolve,
+    );
+  });
+  assertRemoteAccepted(response, 'autoresolve command must be accepted');
+  // Turnstile auto-resolves after 5ms in mock test and completion message appears
+  setTimeout(() => {
+    targetIframe?.remove();
+    if (targetMain) {
+      targetMain.innerText = '签到成功';
+      targetMain.textContent = '签到成功';
+    }
+  }, 5);
+  await waitFor(() => harness.actionResults.some((result) => result.status === 'success' && result.reason === 'completed'), { timeoutMs: 1200, message: 'autoresolved turnstile should complete with success' });
+  assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-required'), false, 'autoresolved turnstile must never trigger captcha-required');
+}
 
 const buildFlushHarness = ({ href, storedResults, windowName = 'p3a-test-tab' }) => {
   let runtimeListener = null;

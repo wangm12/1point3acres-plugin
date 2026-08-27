@@ -64,7 +64,8 @@ const REMOTE_ACTION_TIMEOUT_MS = 5000;
 const QUESTION_READY_TIMEOUT_MS = 5000;
 const REMOTE_ACTION_RETRY_MS = 200;
 let activeRemoteActionId = null;
-const REMOTE_RESULT_TIMEOUT_MS = 12000;
+const REMOTE_RESULT_TIMEOUT_MS = 16000;
+const CAPTCHA_GRACE_PERIOD_MS = 10000;
 const REMOTE_RESULT_REPORT_MAX_RETRIES = 5;
 const REMOTE_RESULT_REPORT_DELAY_MS = 200;
 const REMOTE_RESULT_STORAGE_KEY = 'p3a-pending-remote-results-v1';
@@ -292,7 +293,7 @@ const pauseRemoteAction = (actionId, action, reason) => {
   reportRemoteResult(actionId, action, 'login-blocked', reason).catch(() => {});
 };
 const CAPTCHA_TEXT_RE = /请输入验证码|请填写验证码|填写验证码|验证码|captcha|verification code|security check|请完成(?:安全)?验证|安全验证|人机验证|滑动验证|点选验证|点击倒立文字|拖动滑块|完成拼图|点击图中的|验证码已过期|请重新验证|turnstile|geetest/i;
-const CAPTCHA_ERROR_RE = /验证码错误/i;
+const CAPTCHA_ERROR_RE = /验证码错误|校验失败|验证失败|安全验证失败/i;
 const CAPTCHA_ATTR_RE = /captcha|verify|verification|challenge|geetest|gt[-_]?captcha|hcaptcha|recaptcha|turnstile|aliyun|yidun|tcaptcha|arkoselabs|funcaptcha|mcaptcha|dx-captcha|vaptcha/i;
 const CAPTCHA_WIDGET_TAG_RE = /^(?:IFRAME|IMG|CANVAS|OBJECT|EMBED)$/i;
 const CAPTCHA_WIDGET_ROLE_RE = /button|dialog|group|presentation|region/i;
@@ -373,6 +374,8 @@ const getRemoteResultScope = (action) => {
 };
 const waitForRemoteResult = (action, actionId, status) => new Promise((resolve) => {
   const started = Date.now();
+  let captchaFirstSeenAt = null;
+
   const timer = setInterval(() => {
     const state = action === 'question' ? DailyQuestionPage.getState() : DailyCheckinPage.getState();
     const taskRoot = getRemoteResultScope(action);
@@ -384,25 +387,52 @@ const waitForRemoteResult = (action, actionId, status) => new Promise((resolve) 
     const body = action === 'checkin' && scopedBody !== documentBody
       ? `${scopedBody}\n${documentBody}`
       : scopedBody;
-    const hasCaptchaPrompt = hasConservativeCaptchaPrompt(taskRoot);
-    const successText = action === 'question'
-      ? /答题成功|恭喜[\s\S]{0,20}(?:答对|回答正确)[\s\S]{0,20}(?:获得|得到|赢得)[\s\S]{0,12}(?:大米|米)|(?:已获得|已到账|到账)[\s\S]{0,12}(?:大米|米)|今日已答题|已经答过/i
-      : /签到成功|签到完成|今日已签到|已经签到/i;
+
+    // 1. Explicit error check: if the site explicitly says captcha error / verification failed, fail immediately
     if (CAPTCHA_ERROR_RE.test(body)) {
       clearInterval(timer); finishRemoteAction(actionId, action, 'failed', 'captcha-error'); resolve(false); return;
     }
-    if (hasCaptchaPrompt) {
-      clearInterval(timer); finishRemoteAction(actionId, action, 'failed', 'captcha-required'); resolve(false); return;
-    }
-    if (state === 'completed' || successText.test(body)) {
+
+    const successText = action === 'question'
+      ? /答题成功|恭喜[\s\S]{0,20}(?:答对|回答正确)[\s\S]{0,20}(?:获得|得到|赢得)[\s\S]{0,12}(?:大米|米)|(?:已获得|已到账|到账)[\s\S]{0,12}(?:大米|米)|今日已答题|已经答过/i
+      : /签到成功|签到完成|今日已签到|已经签到/i;
+    const pendingCaptchaRe = /(?:请输入|请完成|需要|继续|通过)[^。！？\n]{0,24}(?:验证码|安全验证|人机验证)/i;
+    const isCompleted = (state === 'completed' || successText.test(body)) && !pendingCaptchaRe.test(body);
+
+    // 2. Success check: if already completed (and not pending captcha input), finish immediately
+    if (isCompleted) {
       clearInterval(timer); finishRemoteAction(actionId, action, 'success', 'completed'); resolve(true); return;
     }
+
+    const hasCaptchaPrompt = hasConservativeCaptchaPrompt(taskRoot);
+
+    // 3. Cloudflare / Captcha challenge check with grace period for automatic resolution
+    if (hasCaptchaPrompt) {
+      if (captchaFirstSeenAt == null) {
+        captchaFirstSeenAt = Date.now();
+      }
+      // If the challenge persists past the grace period, treat it as a true Hard Block
+      if (Date.now() - captchaFirstSeenAt >= CAPTCHA_GRACE_PERIOD_MS) {
+        clearInterval(timer); finishRemoteAction(actionId, action, 'failed', 'captcha-required'); resolve(false); return;
+      }
+      // While captcha is active and within grace period, keep polling in background
+      return;
+    }
+
+    // Captcha is not active (or was auto-resolved/dismissed)
+    captchaFirstSeenAt = null;
+
+    // 4. Requires login check
     if (state === 'requires-login') {
       clearInterval(timer); pauseRemoteAction(actionId, action, 'requires-login'); resolve(false); return;
     }
+
+    // 5. Site failed check
     if (/提交失败|操作失败|系统错误/i.test(body)) {
       clearInterval(timer); finishRemoteAction(actionId, action, 'failed', 'site-failed'); resolve(false); return;
     }
+
+    // 6. Overall timeout check
     if (Date.now() - started >= REMOTE_RESULT_TIMEOUT_MS) {
       clearInterval(timer); finishRemoteAction(actionId, action, 'failed', 'timeout'); resolve(false);
     }
