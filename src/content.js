@@ -17,7 +17,9 @@ const bridge = Object.freeze({
         ExtensionProtocol.createMessage(type, {
           ...payload,
           pageKind: detectPageKind(),
-          url: location.href,
+          // Only share the stable task route with the worker. Query strings on
+          // the live page may contain temporary challenge/session tokens.
+          url: getTaskPageUrl(location.href),
         }),
         (response) => {
           const error = chrome.runtime.lastError;
@@ -35,6 +37,39 @@ const bridge = Object.freeze({
 const toolbarId = 'p3a-daily-question-helper';
 const checkinToolbarId = DailyCheckinPage.TOOLBAR_ID;
 const getQuestionToolbar = () => document.getElementById(toolbarId);
+const toolbarCollapsed = { question: false, checkin: false };
+const setToolbarCollapsedClass = (bar, collapsed) => {
+  if (!bar) return;
+  if (typeof bar.classList?.toggle === 'function') {
+    bar.classList.toggle('p3a-collapsed', collapsed);
+  } else if (collapsed) {
+    bar.classList?.add?.('p3a-collapsed');
+  } else {
+    bar.classList?.remove?.('p3a-collapsed');
+  }
+};
+const ensureToolbarToggle = (bar, kind) => {
+  if (!bar || !['question', 'checkin'].includes(kind)) return null;
+  let toggle = bar.querySelector?.('.p3a-toolbar-toggle');
+  if (!toggle) {
+    toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'p3a-toolbar-toggle';
+    toggle.setAttribute('aria-controls', bar.id);
+    toggle.addEventListener('click', () => {
+      toolbarCollapsed[kind] = !toolbarCollapsed[kind];
+      setToolbarCollapsedClass(bar, toolbarCollapsed[kind]);
+      toggle.textContent = toolbarCollapsed[kind] ? '展开' : '收起';
+      toggle.setAttribute('aria-expanded', String(!toolbarCollapsed[kind]));
+    });
+  }
+  toggle.textContent = toolbarCollapsed[kind] ? '展开' : '收起';
+  toggle.setAttribute('aria-label', toolbarCollapsed[kind] ? '展开助手工具栏' : '收起助手工具栏');
+  toggle.setAttribute('aria-expanded', String(!toolbarCollapsed[kind]));
+  setToolbarCollapsedClass(bar, toolbarCollapsed[kind]);
+  if (toggle.parentNode !== bar) bar.append(toggle);
+  return toggle;
+};
 const checkinToastId = 'p3a-checkin-complete-toast';
 let checkinToastTimer = null;
 const showCheckinToast = (message = '签到完成') => {
@@ -69,6 +104,8 @@ const CAPTCHA_GRACE_PERIOD_MS = 10000;
 const REMOTE_RESULT_REPORT_MAX_RETRIES = 5;
 const REMOTE_RESULT_REPORT_DELAY_MS = 200;
 const REMOTE_RESULT_STORAGE_KEY = 'p3a-pending-remote-results-v1';
+const PENDING_REMOTE_RESULT_TTL_MS = 60 * 60 * 1000;
+const PENDING_REMOTE_RESULT_MAX = 16;
 const QUESTION_SUBMIT_WAIT_MS = 4000;
 const QUESTION_SUBMIT_POLL_MS = 100;
 const CHECKIN_SUBMIT_WAIT_MS = 2000;
@@ -80,6 +117,7 @@ let checkinStatusNode = null;
 let lastReportedPageSignature = null;
 let pendingRemoteResultStore = null;
 let pendingRemoteResultStorePromise = null;
+let pendingRemoteResultsFlushPromise = null;
 const resultStorage = chrome.storage?.local || null;
 const cleanTextValue = (value) => String(value?.textContent ?? value ?? '').replace(/\s+/g, ' ').trim();
 const awaitResponseOrTimeout = (promise, timeoutMs) => new Promise((resolve) => {
@@ -144,9 +182,17 @@ const loadPendingRemoteResultStore = async () => {
   }
   if (pendingRemoteResultStore) return pendingRemoteResultStore;
   if (!pendingRemoteResultStorePromise) {
-    pendingRemoteResultStorePromise = resultStorage.get(REMOTE_RESULT_STORAGE_KEY).then((stored) => {
+    pendingRemoteResultStorePromise = resultStorage.get(REMOTE_RESULT_STORAGE_KEY).then(async (stored) => {
       const records = stored?.[REMOTE_RESULT_STORAGE_KEY];
-      pendingRemoteResultStore = records && typeof records === 'object' ? { ...records } : {};
+      pendingRemoteResultStore = {};
+      let sanitized = false;
+      for (const [actionId, record] of Object.entries(records && typeof records === 'object' ? records : {})) {
+        if (!record || typeof record !== 'object') { sanitized = true; continue; }
+        const { url: _discardedUrl, ...safeRecord } = record;
+        if (Object.prototype.hasOwnProperty.call(record, 'url')) sanitized = true;
+        pendingRemoteResultStore[actionId] = safeRecord;
+      }
+      if (sanitized && resultStorage?.set) await resultStorage.set({ [REMOTE_RESULT_STORAGE_KEY]: pendingRemoteResultStore }).catch(() => {});
       return pendingRemoteResultStore;
     }).catch(() => {
       pendingRemoteResultStore = {};
@@ -162,9 +208,20 @@ const savePendingRemoteResultStore = async () => {
   if (!resultStorage?.set) return;
   await resultStorage.set({ [REMOTE_RESULT_STORAGE_KEY]: pendingRemoteResultStore || {} }).catch(() => {});
 };
+const prunePendingRemoteResults = (now = Date.now()) => {
+  const cutoff = now - PENDING_REMOTE_RESULT_TTL_MS;
+  for (const [actionId, record] of Object.entries(pendingRemoteResultStore || {})) {
+    if (!record || typeof record !== 'object' || !Number.isFinite(record.updatedAt) || record.updatedAt < cutoff) {
+      delete pendingRemoteResultStore[actionId];
+    }
+  }
+  const entries = Object.entries(pendingRemoteResultStore || {}).sort(([, a], [, b]) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  for (const [actionId] of entries.slice(PENDING_REMOTE_RESULT_MAX)) delete pendingRemoteResultStore[actionId];
+};
 const queuePendingRemoteResult = async (actionId, result) => {
   if (!actionId) return;
   await loadPendingRemoteResultStore();
+  prunePendingRemoteResults();
   const scope = getPendingRemoteResultScope();
   pendingRemoteResultStore[actionId] = {
     ...result,
@@ -172,9 +229,9 @@ const queuePendingRemoteResult = async (actionId, result) => {
     pageKind: scope.pageKind,
     taskUrl: scope.taskUrl,
     tabIdentity: scope.tabIdentity,
-    url: location.href,
     updatedAt: Date.now(),
   };
+  prunePendingRemoteResults();
   await savePendingRemoteResultStore();
 };
 const clearPendingRemoteResult = async (actionId) => {
@@ -309,6 +366,11 @@ const readNodeAttributes = (node) => {
     .join(' ');
 };
 const hasShadowTree = (node) => Boolean(node?.shadowRoot && (node.shadowRoot.children?.length || node.shadowRoot.querySelector?.('*')));
+const isPassiveCloudflareTurnstile = (node) => {
+  const attrs = readNodeAttributes(node);
+  return /challenges\.cloudflare\.com|cf-turnstile|(?:^|\s)cf-chl-widget(?:\s|$)/i.test(attrs)
+    && !/challenge-error-text|challenge-stage/i.test(attrs);
+};
 const walkScopeNodes = (root, visitor) => {
   const queue = [root];
   const visited = new Set();
@@ -325,12 +387,15 @@ const walkScopeNodes = (root, visitor) => {
 const hasConservativeCaptchaPrompt = (taskRoot) => {
   if (!taskRoot) return false;
 
-  // 1. Check for global overlay or modal iframes attached to the document body
+  // 1. Check for global overlay or modal iframes attached to the document body.
+  // A leftover Cloudflare Turnstile "Verifying..." widget is not a hard block:
+  // the site often auto-resolves it after submit. Treating it as captcha-required
+  // yanks a background task tab into the foreground for a one-frame flash.
   if (typeof document?.querySelector === 'function') {
     const globalCaptchaEl = document.querySelector(
       'iframe[src*="captcha"], iframe[src*="geetest"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="turnstile"], .geetest_holder, .g-recaptcha, .cf-turnstile, [class*="captcha-modal"], [class*="captcha_modal"], [id*="captcha_box"], [id*="geetest"], [class*="yidun"], [class*="tcaptcha"]'
     );
-    if (globalCaptchaEl) return true;
+    if (globalCaptchaEl && !isPassiveCloudflareTurnstile(globalCaptchaEl)) return true;
   }
 
   const scopeText = readNodeText(taskRoot);
@@ -340,6 +405,7 @@ const hasConservativeCaptchaPrompt = (taskRoot) => {
   let hasSuspiciousWidget = false;
   walkScopeNodes(taskRoot, (node) => {
     if (node === taskRoot) return false;
+    if (isPassiveCloudflareTurnstile(node)) return false;
     const tagName = String(node?.tagName || '').toUpperCase();
     const attrs = readNodeAttributes(node);
     const nodeText = readNodeText(node);
@@ -360,6 +426,42 @@ const hasConservativeCaptchaPrompt = (taskRoot) => {
   });
   return hasDirectPromptControl || hasSuspiciousWidget;
 };
+const hasPageCaptchaChallenge = (taskRoot = null) => {
+  const title = String(document?.title || '');
+  const cloudflareTitle = /just a moment|checking your browser|attention required|cloudflare/i.test(title);
+  // Do not treat every Cloudflare Turnstile iframe as a hard block: a
+  // challenge can be mounted before the site auto-resolves it. Inspect the
+  // actual node attributes so a normal CAPTCHA iframe still fails closed.
+  let activeChallenge = false;
+  let hasCloudflareTurnstile = false;
+  walkScopeNodes(document?.body || taskRoot, (node) => {
+    const tagName = String(node?.tagName || '').toUpperCase();
+    const attrs = readNodeAttributes(node);
+    const cloudflareTurnstile = /challenges\.cloudflare\.com|cf-turnstile|turnstile/i.test(attrs);
+    if (cloudflareTurnstile) {
+      hasCloudflareTurnstile = true;
+      return false;
+    }
+    if (tagName === 'IFRAME' && /captcha|recaptcha|hcaptcha|geetest/i.test(attrs)) { activeChallenge = true; return true; }
+    if (/(?:^|\s)(?:cf-chl-widget|g-recaptcha|geetest[-_]?holder|captcha[-_]?modal)(?:\s|$)/i.test(attrs) || /challenge-stage|challenge-error-text|captcha_box/i.test(attrs)) {
+      activeChallenge = true;
+      return true;
+    }
+    if (CAPTCHA_ATTR_RE.test(attrs) && !/^(?:INPUT|TEXTAREA)$/i.test(tagName)) {
+      // A descriptive data-widget/host is evidence of a challenge, while a
+      // bare text label is handled by the stronger page-text check below.
+      activeChallenge = true;
+      return true;
+    }
+    return false;
+  });
+  if (cloudflareTitle && hasCloudflareTurnstile) return false;
+  if (cloudflareTitle) return true;
+  if (activeChallenge) return true;
+  const scopeText = readNodeText(taskRoot || document.body);
+  return /just a moment|checking your browser|verify you are human|security check|请输入验证码|请填写验证码|verification code|请完成(?:安全)?验证|人机验证|滑动验证|点选验证|请重新验证/i.test(scopeText)
+    && !/签到成功|今日已签到|答题成功|今日已答题/i.test(scopeText);
+};
 const getRemoteResultScope = (action) => {
   if (action === 'question') {
     return DailyQuestionPage.findQuestionContainer(document)
@@ -372,6 +474,12 @@ const getRemoteResultScope = (action) => {
     || document.querySelector?.('main')
     || document.body;
 };
+const COMPLETION_TOAST_SELECTOR = '[role="status"], [role="alert"], [class*="toast"], [class*="message"], [class*="notification"]';
+const readCompletionToastText = (root = document) => Array.from(root.querySelectorAll?.(COMPLETION_TOAST_SELECTOR) || [])
+  .filter((node) => !node.closest?.('#p3a-daily-question-helper, #p3a-daily-checkin-helper'))
+  .map((node) => readNodeText(node))
+  .filter(Boolean)
+  .join('\n');
 const waitForRemoteResult = (action, actionId, status) => new Promise((resolve) => {
   const started = Date.now();
   let captchaFirstSeenAt = null;
@@ -384,9 +492,10 @@ const waitForRemoteResult = (action, actionId, status) => new Promise((resolve) 
     // getRemoteResultScope. Include the page text as a fallback so a genuine
     // submission cannot time out merely because the toast moved in the DOM.
     const documentBody = String(document.body?.innerText || document.body?.textContent || '');
+    const toastText = readCompletionToastText(document);
     const body = action === 'checkin' && scopedBody !== documentBody
       ? `${scopedBody}\n${documentBody}`
-      : scopedBody;
+      : [scopedBody, toastText].filter((part, index, all) => part && all.indexOf(part) === index).join('\n');
 
     // 1. Explicit error check: if the site explicitly says captcha error / verification failed, fail immediately
     if (CAPTCHA_ERROR_RE.test(body)) {
@@ -439,22 +548,28 @@ const waitForRemoteResult = (action, actionId, status) => new Promise((resolve) 
   }, 200);
 });
 const flushPendingRemoteResults = async () => {
-  const store = await loadPendingRemoteResultStore();
-  const scope = getPendingRemoteResultScope();
-  const entries = Object.entries(store || {});
-  for (const [actionId, result] of entries) {
-    if (!result || typeof result !== 'object') {
-      delete pendingRemoteResultStore[actionId];
-      continue;
+  if (pendingRemoteResultsFlushPromise) return pendingRemoteResultsFlushPromise;
+  pendingRemoteResultsFlushPromise = (async () => {
+    const store = await loadPendingRemoteResultStore();
+    const scope = getPendingRemoteResultScope();
+    const entries = Object.entries(store || {});
+    for (const [actionId, result] of entries) {
+      if (!result || typeof result !== 'object') {
+        delete pendingRemoteResultStore[actionId];
+        continue;
+      }
+      if (!result.actionId || result.actionId !== actionId || !result.pageKind || !result.taskUrl || !result.tabIdentity || !Number.isFinite(result.updatedAt) || result.updatedAt < Date.now() - PENDING_REMOTE_RESULT_TTL_MS) {
+        delete pendingRemoteResultStore[actionId];
+        continue;
+      }
+      if (!isSamePendingRemoteResultScope(result, scope)) continue;
+      await reportRemoteResult(actionId, result.action, result.status, result.reason);
     }
-    if (!result.actionId || result.actionId !== actionId || !result.pageKind || !result.taskUrl || !result.tabIdentity) {
-      delete pendingRemoteResultStore[actionId];
-      continue;
-    }
-    if (!isSamePendingRemoteResultScope(result, scope)) continue;
-    await reportRemoteResult(actionId, result.action, result.status, result.reason);
-  }
-  await savePendingRemoteResultStore();
+    await savePendingRemoteResultStore();
+  })().finally(() => {
+    pendingRemoteResultsFlushPromise = null;
+  });
+  return pendingRemoteResultsFlushPromise;
 };
 const waitForQuestionSubmit = async (questionKey, optionTexts, answerText) => {
   const startedAt = Date.now();
@@ -486,7 +601,6 @@ const waitForCheckinSubmit = async () => {
 const waitForStableQuestionSnapshot = async (startedAt, deadlineMs = REMOTE_ACTION_TIMEOUT_MS) => {
   let lastSignature = '';
   let stableCount = 0;
-  let initialReadySignature = null;
   while (Date.now() - startedAt < deadlineMs) {
     const state = DailyQuestionPage.getState();
     const questionResult = DailyQuestionPage.findQuestion();
@@ -503,13 +617,12 @@ const waitForStableQuestionSnapshot = async (startedAt, deadlineMs = REMOTE_ACTI
       continue;
     }
     const signature = `${question}\u0001${optionTexts.join('\u0001')}`;
-    if (!initialReadySignature) {
-      initialReadySignature = signature;
-    } else if (signature !== initialReadySignature) {
-      return { ok: false, reason: 'question-changed-or-unavailable' };
+    if (signature !== lastSignature) {
+      lastSignature = signature;
+      stableCount = 1;
+    } else {
+      stableCount += 1;
     }
-    if (signature === lastSignature) stableCount += 1; else stableCount = 1;
-    lastSignature = signature;
     if (stableCount >= 2) {
       return { ok: true, question, optionNodes, optionTexts, state };
     }
@@ -527,14 +640,25 @@ const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) =>
   const status = questionStatusNode || { textContent: '' };
   const failRemote = actionId ? (reason) => finishRemoteAction(actionId, 'question', 'failed', reason) : () => {};
   try {
+    if (hasPageCaptchaChallenge(getRemoteResultScope('question'))) {
+      failRemote('captcha-required');
+      status.textContent = '页面需要安全验证，请手动完成，未提交';
+      return;
+    }
     const startedAt = Date.now();
     const questionReadyTimeoutMs = actionId ? QUESTION_READY_TIMEOUT_MS : REMOTE_ACTION_TIMEOUT_MS;
+    let lastLookupMiss = null;
     while (Date.now() - startedAt < REMOTE_ACTION_TIMEOUT_MS) {
       const snapshot = await waitForStableQuestionSnapshot(startedAt, questionReadyTimeoutMs);
       if (!snapshot.ok) {
         if (snapshot.reason === 'requires-login') {
           pauseRemoteAction(actionId, 'question', 'requires-login');
           status.textContent = '需登录：登录后会自动继续答题';
+          return;
+        }
+        if (snapshot.reason === 'question-not-ready' && lastLookupMiss === 'answer-not-visible') {
+          failRemote('answer-not-visible');
+          status.textContent = '题库答案不在当前选项中，未提交';
           return;
         }
         failRemote(snapshot.reason);
@@ -551,8 +675,24 @@ const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) =>
         continue;
       }
       if (result.status === 'unmatched' || result.status === 'ambiguous') {
-        failRemote(result.status === 'ambiguous' ? 'answer-option-ambiguous' : 'question-unmatched');
-        status.textContent = result.status === 'ambiguous' ? '正确答案多候选，未提交' : '未收录：不能一键答题';
+        const unmatchedReason = result.status === 'ambiguous'
+          ? 'answer-option-ambiguous'
+          : (result.reason === 'answer-not-visible' ? 'answer-not-visible' : 'question-unmatched');
+        lastLookupMiss = unmatchedReason;
+        if (unmatchedReason === 'answer-not-visible' && Date.now() - startedAt < questionReadyTimeoutMs) {
+          status.textContent = '题库答案尚未出现在选项中，继续等待…';
+          await new Promise((resolve) => setTimeout(resolve, REMOTE_ACTION_RETRY_MS));
+          continue;
+        }
+        failRemote(unmatchedReason);
+        status.textContent = result.status === 'ambiguous'
+          ? '正确答案多候选，未提交'
+          : (result.reason === 'answer-not-visible' ? '题库答案不在当前选项中，未提交' : '未收录：不能一键答题');
+        return;
+      }
+      if (result.matchType !== 'exact') {
+        failRemote('question-fuzzy-match-requires-confirmation');
+        status.textContent = '仅基于相似题目命中，需人工确认，未提交';
         return;
       }
       if (!Number.isInteger(result.optionIndex) || result.optionIndex < 0 || result.optionIndex >= snapshot.optionNodes.length || !snapshot.optionNodes[result.optionIndex]) {
@@ -623,6 +763,11 @@ const runCheckinAction = async ({ actionId = null } = {}) => {
   const status = checkinStatusNode || { textContent: '' };
   const failRemote = actionId ? (reason) => finishRemoteAction(actionId, 'checkin', 'failed', reason) : () => {};
   try {
+    if (hasPageCaptchaChallenge(getRemoteResultScope('checkin'))) {
+      failRemote('captcha-required');
+      status.textContent = '页面需要安全验证，请手动完成，未提交';
+      return;
+    }
     const currentState = DailyCheckinPage.getState();
     if (currentState === 'requires-login') { pauseRemoteAction(actionId, 'checkin', 'requires-login'); status.textContent = '需登录：登录后会自动继续签到'; return; }
     if (currentState === 'completed') { finishRemoteAction(actionId, 'checkin', 'success', 'already-completed'); status.textContent = '已完成：今日已签到'; return; }
@@ -660,8 +805,10 @@ const runCheckinAction = async ({ actionId = null } = {}) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type !== ExtensionProtocol.MESSAGE_TYPES.RUN_ONE_CLICK) return false;
   const action = message.payload?.action;
-  const actionId = message.payload?.actionId ?? message.payload?.workflowId ?? null;
+  const actionId = typeof message.payload?.actionId === 'string' && message.payload.actionId ? message.payload.actionId : null;
   const workflowId = message.payload?.workflowId ?? null;
+  if (!actionId) return false;
+  if (!['question', 'checkin'].includes(action)) return false;
   const accept = (extra = {}) => {
     sendResponse({ ok: true, accepted: true, actionId, ...extra });
     return true;
@@ -670,9 +817,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: false, accepted: false, actionId, error });
     return true;
   };
-  if (!['question', 'checkin'].includes(action)) return reject('invalid-action');
   if ((action === 'question' && !isQuestionPage()) || (action === 'checkin' && !isCheckinPage())) return reject('wrong-page');
-  if (!actionId) return reject('not-ready');
   if (pendingRemoteActions.has(actionId)) return accept({ duplicate: true });
   if (remoteActionResults.has(actionId)) {
     const result = remoteActionResults.get(actionId);
@@ -693,6 +838,7 @@ let prepared = null;
 // deliberately keyed only by the question, not by an option DOM node: React
 // may replace the option nodes after the click.
 let autoSelectedKey = null;
+let autoSubmitKey = null;
 let answerActionKey = null;
 let answerActionId = null;
 let renderGeneration = 0;
@@ -715,15 +861,16 @@ const render = async () => {
   let bar = getQuestionToolbar();
   if (!bar) { bar = document.createElement('section'); bar.id = toolbarId; bar.setAttribute('role', 'region'); bar.setAttribute('aria-label', '每日答题助手'); document.body.appendChild(bar); }
   const status = document.createElement('span'); status.className = 'p3a-status'; status.setAttribute('aria-live', 'polite');
-  const questionResult = DailyQuestionPage.findQuestion(); const optionNodes = DailyQuestionPage.findOptions(document, DailyQuestionPage.findQuestionContainer()); const question = questionResult.value; const options = optionNodes.map(DailyQuestionPage.clean); bar.replaceChildren(status);
+  const questionResult = DailyQuestionPage.findQuestion(); const optionNodes = DailyQuestionPage.findOptions(document, DailyQuestionPage.findQuestionContainer()); const question = questionResult.value; const options = optionNodes.map(DailyQuestionPage.clean); bar.replaceChildren(status); ensureToolbarToggle(bar, 'question');
   const state = DailyQuestionPage.getState();
-  if (state === 'requires-login') { prepared = null; autoSelectedKey = null; answerActionKey = null; answerActionId = null; clearAnswerMarks(optionNodes); status.textContent = '需登录：请先登录一亩三分地'; return; }
-  if (state === 'completed') { prepared = null; autoSelectedKey = null; answerActionKey = null; answerActionId = null; clearAnswerMarks(optionNodes); status.textContent = '已完成：今日已答题'; return; }
+  if (state === 'requires-login') { prepared = null; autoSelectedKey = null; autoSubmitKey = null; answerActionKey = null; answerActionId = null; clearAnswerMarks(optionNodes); status.textContent = '需登录：请先登录一亩三分地'; return; }
+  if (state === 'completed') { prepared = null; autoSelectedKey = null; autoSubmitKey = null; answerActionKey = null; answerActionId = null; clearAnswerMarks(optionNodes); status.textContent = '已完成：今日已答题'; return; }
   if (!question || !options.length) { prepared = null; autoSelectedKey = null; questionLookupRetryKey = null; questionLookupRetryStartedAt = 0; clearAnswerMarks(optionNodes); status.textContent = '加载中或暂未识别到题目'; return; }
   const questionKey = normalizeQuestion(question);
   if (prepared && prepared.questionKey !== questionKey) prepared = null;
   if (answerActionKey && !answerActionKey.includes(`:${questionKey}:`)) { answerActionKey = null; answerActionId = null; }
   if (autoSelectedKey && autoSelectedKey !== questionKey) autoSelectedKey = null;
+  if (autoSubmitKey && autoSubmitKey !== questionKey) autoSubmitKey = null;
   if (questionLookupRetryKey !== questionKey) {
     questionLookupRetryKey = questionKey;
     questionLookupRetryStartedAt = Date.now();
@@ -747,7 +894,9 @@ const render = async () => {
   questionLookupRetryKey = null;
   questionLookupRetryStartedAt = 0;
   if (!result || result.status === 'unmatched' || result.status === 'ambiguous') {
-    prepared = null; autoSelectedKey = null; answerActionKey = null; answerActionId = null; clearAnswerMarks(optionNodes); status.textContent = result?.status === 'ambiguous' ? '多候选：请手动选择并保存，不能一键答题' : '未收录：请手动选择并保存，不能一键答题';
+    prepared = null; autoSelectedKey = null; autoSubmitKey = null; answerActionKey = null; answerActionId = null; clearAnswerMarks(optionNodes); status.textContent = result?.status === 'ambiguous'
+      ? '多候选：请手动选择并保存，不能一键答题'
+      : (result?.reason === 'answer-not-visible' ? '题库答案不在当前选项中，请手动核对' : '未收录：请手动选择并保存，不能一键答题');
     const remember = document.createElement('button'); remember.type = 'button'; remember.textContent = '记住当前答案'; remember.className = 'p3a-action';
     remember.addEventListener('click', async () => { const currentQuestionResult = DailyQuestionPage.findQuestion(); const currentOptions = DailyQuestionPage.findOptions(document, DailyQuestionPage.findQuestionContainer()); const selected = DailyQuestionPage.findSelectedOption(document, currentOptions); const currentQuestion = currentQuestionResult.value; if (!currentQuestion || currentQuestion !== question || currentOptions.length !== optionNodes.length || currentOptions.some((node, index) => node !== optionNodes[index]) || !selected || currentOptions.filter((node) => node === selected).length !== 1) { status.textContent = '题目或选项已变化，或没有唯一选中项，未保存'; return; } const response = await bridge.send(ExtensionProtocol.MESSAGE_TYPES.SAVE_LEARNED_ANSWER, { question: currentQuestion, answer: DailyQuestionPage.clean(selected) }).catch(() => null); status.textContent = response?.ok ? '已记住当前答案' : '保存失败，请稍后重试'; });
     bar.append(remember); return;
@@ -764,26 +913,42 @@ const render = async () => {
   const lookupOptionTexts = options;
   const lookupAnswerText = cleanTextValue(result.answerText);
   const selected = DailyQuestionPage.findSelectedOption(document, optionNodes);
-  if (selected === target && (prepared?.questionKey === questionKey || autoSelectedKey === questionKey)) {
-    // React may have replaced the option node after selection. Rebind the
-    // prepared state to the live node so the extension submit guard remains valid.
-    prepared = { questionKey, optionIndex: result.optionIndex, node: target, answer: lookupAnswerText, optionTexts: lookupOptionTexts };
-    submit.disabled = false;
+  if (result.matchType === 'exact') {
+    if (selected === target && (prepared?.questionKey === questionKey || autoSelectedKey === questionKey)) {
+      // React may have replaced the option node after selection. Rebind the
+      // prepared state to the live node so the extension submit guard remains valid.
+      prepared = { questionKey, optionIndex: result.optionIndex, node: target, answer: lookupAnswerText, optionTexts: lookupOptionTexts };
+      submit.disabled = false;
+    }
   }
-  if (autoSelectedKey !== questionKey && selected !== target && typeof target.click === 'function') {
+  if (result.matchType === 'exact' && autoSelectedKey !== questionKey && selected !== target && typeof target.click === 'function') {
     autoSelectedKey = questionKey;
     try {
       target.click();
       prepared = { questionKey, optionIndex: result.optionIndex, node: target, answer: lookupAnswerText, optionTexts: lookupOptionTexts };
       submit.disabled = false;
-      status.textContent = result.matchType === 'fuzzy' ? `已基于相似题目自动选中：${result.answerText}，请检查后提交` : `已自动选中：${result.answerText}，请检查后提交`;
+      status.textContent = `已自动选中：${result.answerText}，请检查后提交`;
     } catch {
-      status.textContent = result.matchType === 'fuzzy' ? `已基于相似题目自动匹配：${result.answerText}，请手动选择` : `已命中：${result.answerText}，请手动选择`;
+      status.textContent = `已命中：${result.answerText}，请手动选择`;
+    }
+  }
+  if (result.matchType === 'exact' && autoSubmitKey !== questionKey && !activeRemoteActionId && !pendingRemoteActions.size) {
+    const liveSelected = DailyQuestionPage.findSelectedOption(document, optionNodes);
+    if (liveSelected === target && DailyQuestionPage.findSubmit()) {
+      autoSubmitKey = questionKey;
+      status.textContent = `已自动选中：${result.answerText}，正在提交`;
+      runQuestionAction().catch(() => {});
     }
   }
   select.addEventListener('click', () => { const node = optionNodes[result.optionIndex]; if (!node || typeof node.click !== 'function') return; try { node.click(); } catch { return; } prepared = { questionKey, optionIndex: result.optionIndex, node, answer: lookupAnswerText, optionTexts: lookupOptionTexts }; status.textContent = '已选中，请检查验证码后提交'; submit.disabled = false; });
-  submit.addEventListener('click', () => { const currentOptions = DailyQuestionPage.findOptions(document, DailyQuestionPage.findQuestionContainer()); const currentQuestion = normalizeQuestion(DailyQuestionPage.findQuestion().value); const node = prepared && currentOptions[prepared.optionIndex]; const selected = DailyQuestionPage.findSelectedOption(document, currentOptions); if (!prepared || prepared.questionKey !== currentQuestion || !node || node !== prepared.node || selected !== node) { submit.disabled = true; status.textContent = '题目或选项已变化，或官网未确认选中，未提交'; return; } const button = DailyQuestionPage.findSubmit(); if (button && !button.disabled) { try { clickVisibleQuestionSubmit(button); status.textContent = '已触发官网提交，等待结果'; } catch { status.textContent = '官网提交按钮已变化，未提交，请重试'; } } else status.textContent = '未找到已启用的官网提交按钮，未提交'; });
-  oneClick.addEventListener('click', () => { runQuestionAction().catch(() => {}); });
+  submit.addEventListener('click', () => {
+    if (activeRemoteActionId || pendingRemoteActions.size) { status.textContent = '后台任务进行中，请等待结果'; return; }
+    const currentOptions = DailyQuestionPage.findOptions(document, DailyQuestionPage.findQuestionContainer()); const currentQuestion = normalizeQuestion(DailyQuestionPage.findQuestion().value); const node = prepared && currentOptions[prepared.optionIndex]; const selected = DailyQuestionPage.findSelectedOption(document, currentOptions); if (!prepared || prepared.questionKey !== currentQuestion || !node || node !== prepared.node || selected !== node) { submit.disabled = true; status.textContent = '题目或选项已变化，或官网未确认选中，未提交'; return; } const button = DailyQuestionPage.findSubmit(); if (button && !button.disabled) { try { clickVisibleQuestionSubmit(button); status.textContent = '已触发官网提交，等待结果'; } catch { status.textContent = '官网提交按钮已变化，未提交，请重试'; } } else status.textContent = '未找到已启用的官网提交按钮，未提交';
+  });
+  oneClick.addEventListener('click', () => {
+    if (activeRemoteActionId || pendingRemoteActions.size) { status.textContent = '后台任务进行中，请等待结果'; return; }
+    runQuestionAction().catch(() => {});
+  });
   remember.addEventListener('click', async () => { const currentQuestionResult = DailyQuestionPage.findQuestion(); const currentOptions = DailyQuestionPage.findOptions(document, DailyQuestionPage.findQuestionContainer()); const selected = DailyQuestionPage.findSelectedOption(document, currentOptions); const currentQuestion = currentQuestionResult.value; if (!currentQuestion || currentQuestion !== question || currentOptions.length !== optionNodes.length || currentOptions.some((node, index) => node !== optionNodes[index]) || !selected || currentOptions.filter((node) => node === selected).length !== 1) { status.textContent = '题目或选项已变化，或没有唯一选中项，未保存'; return; } const response = await bridge.send(ExtensionProtocol.MESSAGE_TYPES.SAVE_LEARNED_ANSWER, { question: currentQuestion, answer: DailyQuestionPage.clean(selected) }).catch(() => null); status.textContent = response?.ok ? '已记住当前答案' : '保存失败，请稍后重试'; }); bar.append(oneClick, select, remember, submit);
 };
 let checkinPrepared = null;
@@ -799,7 +964,7 @@ const renderCheckin = () => {
   if (!bar) { bar = document.createElement('section'); bar.id = checkinToolbarId; bar.setAttribute('role', 'region'); bar.setAttribute('aria-label', '每日签到助手'); document.body.appendChild(bar); }
   const status = document.createElement('span'); status.className = 'p3a-status'; status.setAttribute('aria-live', 'polite');
   checkinStatusNode = status;
-  bar.replaceChildren(status);
+  bar.replaceChildren(status); ensureToolbarToggle(bar, 'checkin');
   const state = DailyCheckinPage.getState();
   if (state === 'requires-login') { checkinPrepared = null; checkinAutoAttempt = null; checkinActionKey = null; status.textContent = '需登录：请先登录一亩三分地'; return; }
   if (state === 'completed') { checkinPrepared = null; checkinAutoAttempt = null; checkinActionKey = null; status.textContent = '今日已签到，不能重复签到'; return; }
@@ -837,6 +1002,7 @@ const renderCheckin = () => {
     confirm.disabled = false; status.textContent = '已准备，请检查后确认签到';
   });
   confirm.addEventListener('click', async () => {
+    if (activeRemoteActionId || pendingRemoteActions.size) { status.textContent = '后台任务进行中，请等待结果'; return; }
     const remoteActionId = activeRemoteActionId;
     activeRemoteActionId = null;
     const current = DailyCheckinPage.findDefault();
@@ -850,6 +1016,7 @@ const renderCheckin = () => {
     } catch { status.textContent = '未能点击站点签到按钮，请手动提交'; }
   });
   oneClick.addEventListener('click', async () => {
+    if (activeRemoteActionId || pendingRemoteActions.size) { status.textContent = '后台任务进行中，请等待结果'; return; }
     const remoteActionId = activeRemoteActionId;
     activeRemoteActionId = null;
     const failRemote = (reason) => finishRemoteAction(remoteActionId, 'checkin', 'failed', reason);
@@ -901,13 +1068,14 @@ const retryInitialQuestionRender = () => {
 if (isQuestionPage() || isCheckinPage()) {
   reportContentReady(true);
   flushPendingRemoteResults().catch(() => {});
+  const observationRoot = document.querySelector?.('main, form, [data-page="daily-question"], [data-page="daily-checkin"]') || document.body;
   new MutationObserver((records) => {
     const relevant = records.some((record) => !record.target.closest?.(`#${toolbarId}, #${checkinToolbarId}, #${checkinToastId}`));
     if (!relevant) return;
     reportContentReady();
     if (isQuestionPage()) schedule();
     if (isCheckinPage()) scheduleCheckin();
-  }).observe(document.body, { childList: true, subtree: true, characterData: true });
+  }).observe(observationRoot, { childList: true, subtree: true, characterData: true });
   if (isQuestionPage()) { schedule(); retryInitialQuestionRender(); }
   if (isCheckinPage()) scheduleCheckin();
 }

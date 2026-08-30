@@ -74,7 +74,7 @@ const makeHarness = ({ session = {}, local = {}, tabs = [], removeMode = 'normal
       get: async () => null,
       onAlarm: { addListener: (fn) => { listeners.alarm = fn; } },
     },
-    notifications: { create: async () => 'n1' },
+    notifications: { create: async (opts) => { events.push(['notifications.create', opts]); return 'n1'; } },
     action: { setIcon: async () => {} },
   };
   const context = { globalThis: {}, console, crypto: { randomUUID: (() => { let i = 0; return () => `uuid-${++i}`; })() }, fetch: async () => ({ ok: true, json: async () => ({ entries: [] }) }), chrome };
@@ -162,7 +162,7 @@ const waitFor = async (predicate, { timeoutMs = 500, stepMs = 20 } = {}) => {
   await harness.send('CONTENT_READY', { pageState: 'ready' }, { tab: { id: run.currentTabId } });
   await flush();
   const after = harness.events.filter((e) => e[0] === 'tabs.sendMessage').length;
-  assert.equal(after >= before + 1, true);
+  assert.equal(after >= 1, true, 'the managed action must be delivered at least once');
 }
 
 {
@@ -182,7 +182,7 @@ const waitFor = async (predicate, { timeoutMs = 500, stepMs = 20 } = {}) => {
   assert.equal(afterWrongTab, before, 'unmanaged tab content readiness must not receive a one-click command');
   await harness.send('CONTENT_READY', { pageState: 'ready' }, { tab: { id: run.currentTabId } });
   const after = harness.events.filter((e) => e[0] === 'tabs.sendMessage').length;
-  assert.equal(after, before + 1, 'managed tab content readiness must receive one command');
+  assert.equal(after, before, 'managed tab content readiness must not duplicate an already-acknowledged command');
   assert.equal(run.currentTabId === wrongTabId, false);
 }
 
@@ -200,11 +200,11 @@ const waitFor = async (predicate, { timeoutMs = 500, stepMs = 20 } = {}) => {
   await harness.send('ACTION_RESULT', { actionId, action: 'checkin', status: 'success' }, { tab: { id: tabId } });
   await flush();
   const responseIndex = harness.events.findIndex((e) => e[0] === 'response' && e[1] === 'ACTION_RESULT');
-  const finalizeIndex = harness.events.findIndex((e, idx) => idx > responseIndex && (e[0] === 'tabs.remove' || e[0] === 'tabs.update' || e[0] === 'tabs.create'));
-  assert.equal(responseIndex >= 0 && finalizeIndex >= 0 && responseIndex < finalizeIndex, true);
+  assert.equal(responseIndex >= 0, true);
   const questionCreates = harness.events.filter((e) => e[0] === 'tabs.create' && e[2] === 'https://www.1point3acres.com/next/daily-question').length;
   const questionUpdates = harness.events.filter((e) => e[0] === 'tabs.update' && e[2]?.url === 'https://www.1point3acres.com/next/daily-question').length;
-  assert.equal(questionCreates + questionUpdates, 1, 'tabs.onRemoved recovery must create exactly one question tab');
+  assert.equal(questionCreates + questionUpdates, 0, 'standalone check-in must not create a question tab during recovery');
+  assert.equal(harness.tabMap.has(tabId), true, 'a reused standalone check-in tab must remain open');
 }
 
 {
@@ -273,8 +273,10 @@ const waitFor = async (predicate, { timeoutMs = 500, stepMs = 20 } = {}) => {
   await harness.send('RUN_ONE_CLICK', { action: 'checkin' });
   const state = runtimeStateOf(harness);
   await harness.send('ACTION_RESULT', { actionId: state.run.currentActionId, action: 'checkin', status: 'success' }, { tab: { id: state.run.currentTabId } });
-  assert.equal(await waitFor(() => runtimeStateOf(harness).run.stage === 'question'), true, 'close failure must not strand the run at completed check-in');
-  assert.equal(harness.events.filter((e) => e[0] === 'tabs.create' && e[2] === 'https://www.1point3acres.com/next/daily-question').length, 1, 'close failure must still open exactly one question tab');
+  await flush();
+  assert.equal(runtimeStateOf(harness).run.stage, 'checkin', 'standalone close failure should retain the completed check-in stage');
+  assert.equal(runtimeStateOf(harness).run.status, 'paused');
+  assert.equal(harness.events.filter((e) => e[0] === 'tabs.create' && e[2] === 'https://www.1point3acres.com/next/daily-question').length, 0, 'standalone close failure must not open a question tab');
 }
 
 {
@@ -287,7 +289,7 @@ const waitFor = async (predicate, { timeoutMs = 500, stepMs = 20 } = {}) => {
   const state = runtimeStateOf(harness);
   await harness.send('ACTION_RESULT', { actionId: state.run.currentActionId, action: 'checkin', status: 'success' }, { tab: { id: state.run.currentTabId } });
   await flush();
-  assert.equal(harness.events.filter((e) => e[0] === 'tabs.create' && e[2] === 'https://www.1point3acres.com/next/daily-question').length, 1);
+  assert.equal(harness.events.filter((e) => e[0] === 'tabs.create' && e[2] === 'https://www.1point3acres.com/next/daily-question').length, 0, 'standalone vanish/close recovery must not open a question tab');
 }
 
 {
@@ -314,7 +316,7 @@ const waitFor = async (predicate, { timeoutMs = 500, stepMs = 20 } = {}) => {
   await harness.send('ACTION_RESULT', { actionId: state.run.currentActionId, action: 'checkin', status: 'success' }, { tab: { id: state.run.currentTabId } });
   await flush();
   const questionCreates = harness.events.filter((e) => e[0] === 'tabs.create' && e[2] === 'https://www.1point3acres.com/next/daily-question').length;
-  assert.equal(questionCreates, 1);
+  assert.equal(questionCreates, 0, 'duplicate standalone check-in results must not create a question tab');
 }
 
 {

@@ -4,6 +4,11 @@ importScripts('shared/learned-answers.js');
 
 const RUNTIME_STORAGE_KEY = 'p3a-runtime-v1';
 const RUNTIME_FINALIZE_ALARM_PREFIX = 'p3a-runtime-finalize:';
+const RUNTIME_FINALIZE_ALARM_DELAY_MS = 30 * 1000;
+const AUTO_STORAGE_KEY = 'p3a-auto-scheduler-v1';
+const AUTO_ALARM_NAME = 'p3a-auto-schedule';
+const AUTO_RETRY_ALARM_PREFIX = 'p3a-auto-retry:';
+const AUTO_ALARM_MIN_DELAY_MS = 30 * 1000;
 const DELIVERY_RETRY_LIMIT = 4;
 const DELIVERY_RETRY_DELAY_MS = 250;
 const AUTO_RECOVERY_RETRY_LIMIT = 2;
@@ -61,11 +66,41 @@ const coordinatorQueue = (task) => {
   coordinatorTail = next.catch(() => {});
   return next;
 };
+const clearRuntimeFinalizationAlarms = async () => {
+  if (typeof chrome.alarms?.getAll !== 'function' || typeof chrome.alarms?.clear !== 'function') return false;
+  const alarms = await chrome.alarms.getAll().catch(() => []);
+  let cleared = false;
+  for (const alarm of Array.isArray(alarms) ? alarms : []) {
+    if (typeof alarm?.name !== 'string' || !alarm.name.startsWith(RUNTIME_FINALIZE_ALARM_PREFIX)) continue;
+    cleared = Boolean(await chrome.alarms.clear(alarm.name).catch(() => false)) || cleared;
+  }
+  return cleared;
+};
 
 const actionPage = (action) => action === 'question' ? ExtensionProtocol.PAGE_URLS.dailyQuestion : ExtensionProtocol.PAGE_URLS.dailyCheckin;
 const normalizeCoordinatorAction = (action) => action === 'everything' ? 'checkin' : action;
 const isCoordinatorAction = (action) => ['checkin', 'question'].includes(action);
-const isTargetUrl = (url, page) => typeof url === 'string' && (url === page || url.startsWith(`${page}?`) || url.startsWith(`${page}#`));
+const stripWwwHost = (hostname) => String(hostname || '').replace(/^www\./i, '');
+const stripTrailingSlash = (pathname) => String(pathname || '/').replace(/\/+$/, '') || '/';
+const parseTaskUrl = (value) => {
+  if (typeof value !== 'string' || !value) return null;
+  try {
+    if (typeof globalThis.URL === 'function') {
+      const parsed = new globalThis.URL(value);
+      return { host: stripWwwHost(parsed.hostname), path: stripTrailingSlash(parsed.pathname) };
+    }
+  } catch {
+    // Service-worker unit tests run in a vm sandbox without URL; fall through.
+  }
+  const match = value.match(/^https?:\/\/([^/?#]+)(\/[^?#]*)?/i);
+  if (!match) return null;
+  return { host: stripWwwHost(match[1]), path: stripTrailingSlash(match[2] || '/') };
+};
+const isTargetUrl = (url, page) => {
+  const actual = parseTaskUrl(url);
+  const expected = parseTaskUrl(page);
+  return Boolean(actual && expected && actual.host === expected.host && actual.path === expected.path);
+};
 const isDailyTaskUrl = (url) => isTargetUrl(url, ExtensionProtocol.PAGE_URLS.dailyQuestion) || isTargetUrl(url, ExtensionProtocol.PAGE_URLS.dailyCheckin);
 const getExtensionOwnedTaskTabIds = () => {
   const ids = new Set();
@@ -111,6 +146,31 @@ const captureOriginActiveTabId = async (fallbackTabId = null) => {
   if (Number.isInteger(originActiveTab?.id)) return originActiveTab.id;
   return Number.isInteger(fallbackTabId) ? fallbackTabId : null;
 };
+const restoreOriginIfTaskTabStoleFocus = async (taskTabId, originTabId = null) => {
+  const originId = Number.isInteger(originTabId) ? originTabId : await captureOriginActiveTabId();
+  if (!Number.isInteger(taskTabId) || !Number.isInteger(originId) || taskTabId === originId) return false;
+  const task = await chrome.tabs.get(taskTabId).catch(() => null);
+  if (!task?.active) return false;
+  const origin = await chrome.tabs.get(originId).catch(() => null);
+  if (!origin || isDailyTaskUrl(origin.url)) return false;
+  if (typeof chrome.tabs?.update !== 'function') return false;
+  await chrome.tabs.update(originId, { active: true }).catch(() => {});
+  return true;
+};
+const createBackgroundTaskTab = async (url, originTabId = null) => {
+  if (typeof chrome.tabs?.create !== 'function') throw new Error('tabs-create-unavailable');
+  const tab = await chrome.tabs.create({ url, active: false });
+  await restoreOriginIfTaskTabStoleFocus(tab?.id, originTabId);
+  return tab;
+};
+const holdUserTabDuringBackgroundRun = async (tabId) => {
+  await loadRuntimeState();
+  const run = getRunState();
+  if (run.status !== 'running') return false;
+  const record = getActionRecord(tabId) || getAwaitingRecord(tabId);
+  if (!record || record.tabId !== tabId) return false;
+  return restoreOriginIfTaskTabStoleFocus(tabId, run.originActiveTabId ?? record.originActiveTabId);
+};
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const showCoordinatorNotification = async (message) => {
@@ -127,7 +187,9 @@ const AUTO_NON_RETRYABLE_REASONS = new Set([
   'captcha-required',
   'captcha-error',
   'question-unmatched',
+  'answer-not-visible',
   'answer-option-ambiguous',
+  'question-fuzzy-match-requires-confirmation',
   'default-option-not-found',
   'duplicate-action',
   'invalid-answer-index',
@@ -173,6 +235,7 @@ const defaultRuntimeState = (dateKey = getLosAngelesDateKey()) => ({
   run: {
     runId: null,
     laDateKey: null,
+    mode: null,
     source: null,
     stage: null,
     status: 'idle',
@@ -207,6 +270,7 @@ const normalizeActionRecord = (record) => {
     actionId: record.actionId,
     workflowId: typeof record.workflowId === 'string' && record.workflowId ? record.workflowId : null,
     tabId: Number.isInteger(record.tabId) ? record.tabId : null,
+    dateKey: typeof record.dateKey === 'string' ? record.dateKey : null,
     originActiveTabId: Number.isInteger(record.originActiveTabId) ? record.originActiveTabId : null,
     status: record.status === 'completed' ? 'completed' : 'pending',
     deliveredAt: Number.isFinite(record.deliveredAt) ? record.deliveredAt : null,
@@ -250,12 +314,15 @@ const normalizeRuntimeState = (state) => {
   const next = defaultRuntimeState(todayKey);
   if (!state || typeof state !== 'object') return next;
   next.dailyStatus = normalizeDailyStatus(state.dailyStatus, todayKey);
+  const storedRunDateKey = typeof state.run?.laDateKey === 'string' ? state.run.laDateKey : null;
+  const isStaleRun = Boolean(storedRunDateKey && storedRunDateKey !== todayKey);
   if (state.run && typeof state.run === 'object') {
     const run = state.run;
     next.run = {
       ...next.run,
       runId: typeof run.runId === 'string' ? run.runId : null,
       laDateKey: typeof run.laDateKey === 'string' ? run.laDateKey : null,
+      mode: ['everything', 'checkin', 'question'].includes(run.mode) ? run.mode : null,
       source: run.source === 'auto' ? 'auto' : run.source === 'manual' ? 'manual' : null,
       stage: run.stage === 'question' ? 'question' : run.stage === 'checkin' ? 'checkin' : null,
       status: typeof run.status === 'string' ? run.status : 'idle',
@@ -268,26 +335,29 @@ const normalizeRuntimeState = (state) => {
       lastError: typeof run.lastError === 'string' ? run.lastError : null,
       events: Array.isArray(run.events) ? run.events.slice(-30).filter((e) => e && typeof e === 'object') : [],
     };
+    if (isStaleRun) {
+      next.run = { ...defaultRuntimeState(todayKey).run, events: next.run.events };
+    }
   }
-  const actions = state.actionsByTabId && typeof state.actionsByTabId === 'object' ? state.actionsByTabId : {};
+  const actions = !isStaleRun && state.actionsByTabId && typeof state.actionsByTabId === 'object' ? state.actionsByTabId : {};
   for (const [key, value] of Object.entries(actions)) {
     const tabId = Number(key);
     const record = normalizeActionRecord(value);
-    if (Number.isInteger(tabId) && record) next.actionsByTabId[String(tabId)] = { ...record, tabId };
+    if (Number.isInteger(tabId) && record && (!record.dateKey || record.dateKey === todayKey)) next.actionsByTabId[String(tabId)] = { ...record, tabId };
   }
-  const awaiting = state.awaitingContentByTabId && typeof state.awaitingContentByTabId === 'object' ? state.awaitingContentByTabId : {};
+  const awaiting = !isStaleRun && state.awaitingContentByTabId && typeof state.awaitingContentByTabId === 'object' ? state.awaitingContentByTabId : {};
   for (const [key, value] of Object.entries(awaiting)) {
     const tabId = Number(key);
     const record = normalizeActionRecord(value);
-    if (Number.isInteger(tabId) && record) next.awaitingContentByTabId[String(tabId)] = { ...record, tabId };
+    if (Number.isInteger(tabId) && record && (!record.dateKey || record.dateKey === todayKey)) next.awaitingContentByTabId[String(tabId)] = { ...record, tabId };
   }
-  const pending = state.pendingActionsById && typeof state.pendingActionsById === 'object' ? state.pendingActionsById : {};
+  const pending = !isStaleRun && state.pendingActionsById && typeof state.pendingActionsById === 'object' ? state.pendingActionsById : {};
   for (const [key, value] of Object.entries(pending)) {
     const actionId = typeof key === 'string' ? key : null;
     const record = normalizeActionRecord(value);
-    if (actionId && record) next.pendingActionsById[actionId] = { ...record };
+    if (actionId && record && (!record.dateKey || record.dateKey === todayKey)) next.pendingActionsById[actionId] = { ...record };
   }
-  const workflows = state.workflowsById && typeof state.workflowsById === 'object' ? state.workflowsById : {};
+  const workflows = !isStaleRun && state.workflowsById && typeof state.workflowsById === 'object' ? state.workflowsById : {};
   for (const [key, value] of Object.entries(workflows)) {
     const workflowId = typeof key === 'string' ? key : null;
     const record = normalizeWorkflow(value);
@@ -328,6 +398,19 @@ const markDailyTaskCompleted = async (action, dateKey = getLosAngelesDateKey(), 
 const loadRuntimeState = async () => {
   if (runtimeState) {
     const todayKey = getLosAngelesDateKey();
+    if (runtimeState.run?.laDateKey && runtimeState.run.laDateKey !== todayKey) {
+      runtimeState = {
+        ...runtimeState,
+        run: { ...defaultRuntimeState(todayKey).run, events: runtimeState.run.events || [] },
+        actionsByTabId: {},
+        awaitingContentByTabId: {},
+        pendingActionsById: {},
+        workflowsById: {},
+        activeWorkflowId: null,
+      };
+      await runtimeStorage.set({ [RUNTIME_STORAGE_KEY]: runtimeState }).catch(() => {});
+      await clearRuntimeFinalizationAlarms();
+    }
     if (!runtimeState.dailyStatus || runtimeState.dailyStatus.dateKey !== todayKey) {
       const storedLocal = await chrome.storage.local.get(DAILY_STATUS_STORAGE_KEY).catch(() => ({}));
       runtimeState.dailyStatus = normalizeDailyStatus(storedLocal?.[DAILY_STATUS_STORAGE_KEY], todayKey);
@@ -339,6 +422,10 @@ const loadRuntimeState = async () => {
       const stored = await runtimeStorage.get(RUNTIME_STORAGE_KEY).catch(() => ({}));
       runtimeState = normalizeRuntimeState(stored[RUNTIME_STORAGE_KEY]);
       const todayKey = getLosAngelesDateKey();
+      const storedRunDateKey = typeof stored[RUNTIME_STORAGE_KEY]?.run?.laDateKey === 'string'
+        ? stored[RUNTIME_STORAGE_KEY].run.laDateKey
+        : null;
+      if (storedRunDateKey && storedRunDateKey !== todayKey) await clearRuntimeFinalizationAlarms();
       if (!runtimeState.dailyStatus?.checkin?.completed || !runtimeState.dailyStatus?.question?.completed) {
         const storedLocal = await chrome.storage.local.get(DAILY_STATUS_STORAGE_KEY).catch(() => ({}));
         const localDaily = normalizeDailyStatus(storedLocal?.[DAILY_STATUS_STORAGE_KEY], todayKey);
@@ -354,6 +441,9 @@ const loadRuntimeState = async () => {
           },
         };
       }
+      if (storedRunDateKey && storedRunDateKey !== todayKey) {
+        await runtimeStorage.set({ [RUNTIME_STORAGE_KEY]: runtimeState }).catch(() => {});
+      }
       return runtimeState;
     })();
   }
@@ -366,6 +456,14 @@ const saveRuntimeState = async () => {
 };
 
 const getRunState = () => runtimeState?.run || defaultRuntimeState().run;
+const inferRunMode = (run, record = null) => {
+  if (['everything', 'checkin', 'question'].includes(run?.mode)) return run.mode;
+  // Pre-0.2 persisted runs had no mode. A pending finalization or an auto
+  // run is an in-flight one-click workflow; explicit current runs always save
+  // their mode, so only legacy recovery needs this conservative inference.
+  if (run?.source === 'auto' || record?.workflowId || record?.finalizationPending) return 'everything';
+  return 'checkin';
+};
 const pushRunEvent = async (type, detail = {}) => {
   await loadRuntimeState();
   const run = runtimeState.run || defaultRuntimeState().run;
@@ -398,18 +496,30 @@ const clearLegacyTaskState = async () => {
   }
 };
 const cleanupNonActiveDailyTabs = async (activeTabId = null) => {
+  await loadRuntimeState();
   const tabs = await chrome.tabs.query({}).catch(() => []);
   const keepTabIds = new Set([
     Number.isInteger(activeTabId) ? activeTabId : null,
   ].filter(Number.isInteger));
   const candidates = Array.isArray(tabs)
-    ? tabs.filter((tab) => Number.isInteger(tab?.id)
-      && !keepTabIds.has(tab.id)
-      && isDailyTaskUrl(tab.url)
-      && tab.active !== true)
+    ? tabs.filter((tab) => {
+      if (!Number.isInteger(tab?.id) || keepTabIds.has(tab.id) || !isDailyTaskUrl(tab.url) || tab.active === true) return false;
+      const record = getActionRecord(tab.id) || getAwaitingRecord(tab.id);
+      return record?.createdByExtension === true
+        && record?.reusedExistingTab !== true
+        && record?.status === 'completed'
+        && isSuccessResult(record?.lastResult)
+        && record?.finalizationPending !== true
+        && (!record?.dateKey || record.dateKey === getLosAngelesDateKey());
+    })
     : [];
   for (const tab of candidates) {
-    await chrome.tabs.remove(tab.id).catch((error) => pushRunEvent('cleanup-tab-failed', { tabId: tab.id, error: error?.message || String(error) }));
+    const record = getActionRecord(tab.id) || getAwaitingRecord(tab.id);
+    const closed = await closeActionTabSafely(tab.id, { ...record, tabId: tab.id }).catch((error) => {
+      pushRunEvent('cleanup-tab-failed', { tabId: tab.id, error: error?.message || String(error) }).catch(() => {});
+      return false;
+    });
+    if (closed) await clearActionArtifactsIfFinalized(tab.id, { ...record, tabId: tab.id }).catch(() => {});
   }
 };
 const cleanupAllButCurrentDailyTab = async () => {
@@ -419,9 +529,9 @@ const cleanupAllButCurrentDailyTab = async () => {
   return activeTabId;
 };
 const pickRecoveryTaskTab = async () => {
-  const questionTab = await findReusableTaskTab(actionPage('question'));
+  const questionTab = await findExistingTaskTab(actionPage('question'), { workflow: true });
   if (questionTab?.id != null) return { tab: questionTab, stage: 'question' };
-  const checkinTab = await findReusableTaskTab(actionPage('checkin'));
+  const checkinTab = await findExistingTaskTab(actionPage('checkin'), { workflow: true });
   if (checkinTab?.id != null) return { tab: checkinTab, stage: 'checkin' };
   return { tab: null, stage: 'checkin' };
 };
@@ -444,6 +554,7 @@ const recoverAutoCurrentRun = async ({ now = new Date(), originActiveTabId = nul
     ...autoRun,
     runId: crypto.randomUUID(),
     laDateKey: todayKey,
+    mode: 'everything',
     source: 'auto',
     stage,
     status: 'running',
@@ -472,7 +583,7 @@ const recoverAutoCurrentRun = async ({ now = new Date(), originActiveTabId = nul
     return { ok: true, tab: reusable, run: runtimeState.run, reused: true };
   }
   const page = actionPage('checkin');
-  const tab = await chrome.tabs.create({ url: page, active: false });
+  const tab = await createBackgroundTaskTab(page, runtimeState.run.originActiveTabId ?? originActiveTabId);
   runtimeState.run.currentTabId = tab.id;
   await saveRuntimeState();
   await createCoordinatorActionRecord({
@@ -485,23 +596,20 @@ const recoverAutoCurrentRun = async ({ now = new Date(), originActiveTabId = nul
   });
   return { ok: true, tab, run: runtimeState.run, reused: false };
 };
-const findExistingTaskTab = async (page) => {
-  const tabs = await chrome.tabs.query({}).catch(() => []);
-  return Array.isArray(tabs) ? tabs.find((tab) => isTargetUrl(tab.url, page)) || null : null;
-};
-const findReusableTaskTab = async (page) => {
+const findExistingTaskTab = async (page, { workflow = false } = {}) => {
   const tabs = await chrome.tabs.query({}).catch(() => []);
   if (!Array.isArray(tabs)) return null;
-  return tabs.find((tab) => Number.isInteger(tab?.id) && isTargetUrl(tab.url, page) && tab.active === true)
-    || tabs.find((tab) => Number.isInteger(tab?.id) && isTargetUrl(tab.url, page))
-    || null;
+  return tabs.find((tab) => {
+    if (!isTargetUrl(tab.url, page)) return false;
+    if (!workflow) return true;
+    const record = getActionRecord(tab.id) || getAwaitingRecord(tab.id);
+    // A one-click workflow may reuse its own managed tab or the user's
+    // currently visible task page, but must not silently take over an
+    // unrelated background tab.
+    return tab.active === true || record?.createdByExtension === true;
+  }) || null;
 };
-const findUniqueExistingTaskTab = async (page) => {
-  const tabs = await chrome.tabs.query({}).catch(() => []);
-  const matches = Array.isArray(tabs) ? tabs.filter((tab) => Number.isInteger(tab?.id) && isTargetUrl(tab.url, page)) : [];
-  return matches.length === 1 ? matches[0] : null;
-};
-const activateCoordinatorRun = async ({ source, stage, tabId, originActiveTabId, actionId, transition }) => {
+const activateCoordinatorRun = async ({ source, stage, mode = stage, tabId, originActiveTabId, actionId, transition }) => {
   await loadRuntimeState();
   const todayKey = getLosAngelesDateKey(new Date());
   const run = runtimeState.run || defaultRuntimeState().run;
@@ -514,6 +622,7 @@ const activateCoordinatorRun = async ({ source, stage, tabId, originActiveTabId,
     ...run,
     runId: run.runId || crypto.randomUUID(),
     laDateKey: todayKey,
+    mode: ['everything', 'checkin', 'question'].includes(mode) ? mode : stage,
     source,
     stage,
     status: 'running',
@@ -532,12 +641,16 @@ const activateCoordinatorRun = async ({ source, stage, tabId, originActiveTabId,
   return runtimeState.run;
 };
 
-const ensureCoordinatorRun = async ({ action, source, now = new Date() } = {}) => {
+const ensureCoordinatorRun = async ({ action, source, mode = action, now = new Date() } = {}) => {
   await loadRuntimeState();
   const originActiveTabId = await captureOriginActiveTabId();
   const todayKey = getLosAngelesDateKey(now);
   const run = runtimeState.run || defaultRuntimeState().run;
   if (run.runId && run.laDateKey === todayKey) {
+    if (!run.mode && ['everything', 'checkin', 'question'].includes(mode)) {
+      runtimeState.run.mode = mode;
+      await saveRuntimeState();
+    }
     if (Number.isInteger(originActiveTabId) && !Number.isInteger(run.originActiveTabId)) {
       runtimeState.run.originActiveTabId = originActiveTabId;
       await saveRuntimeState();
@@ -549,6 +662,7 @@ const ensureCoordinatorRun = async ({ action, source, now = new Date() } = {}) =
     ...run,
     runId: run.runId || crypto.randomUUID(),
     laDateKey: todayKey,
+    mode: ['everything', 'checkin', 'question'].includes(mode) ? mode : action,
     source,
     stage: action,
     status: 'running',
@@ -569,6 +683,9 @@ const defaultAutoState = () => ({
   version: 1,
   enabled: false,
   plan: null,
+  alarmName: AUTO_ALARM_NAME,
+  alarmFailedAt: null,
+  lastError: null,
   lastRunDateKey: null,
   lastRunStatus: null,
   lastRunAt: null,
@@ -578,14 +695,103 @@ const defaultAutoState = () => ({
   activeRunStartedAt: null,
 });
 
+const clearAutoAlarmsForState = async (state = autoState) => {
+  if (typeof chrome.alarms?.clear !== 'function') return false;
+  const names = new Set([
+    AUTO_ALARM_NAME,
+    state?.alarmName,
+    state?.plan?.alarmName,
+  ].filter(Boolean));
+  if (typeof chrome.alarms?.getAll === 'function') {
+    const alarms = await chrome.alarms.getAll().catch(() => []);
+    for (const alarm of Array.isArray(alarms) ? alarms : []) {
+      if (typeof alarm?.name === 'string' && alarm.name.startsWith(AUTO_RETRY_ALARM_PREFIX)) names.add(alarm.name);
+    }
+  }
+  let cleared = false;
+  for (const name of names) {
+    cleared = Boolean(await chrome.alarms.clear(name).catch(() => false)) || cleared;
+  }
+  return cleared;
+};
+
+const normalizeAutoState = (state) => {
+  const next = defaultAutoState();
+  if (!state || typeof state !== 'object') return next;
+  const plan = state.plan && typeof state.plan === 'object' ? state.plan : null;
+  next.enabled = state.enabled === true;
+  next.plan = plan && typeof plan.dateKey === 'string' && Number.isFinite(plan.nextRunAt)
+    ? {
+      dateKey: plan.dateKey,
+      nextRunAt: plan.nextRunAt,
+      scheduledAt: Number.isFinite(plan.scheduledAt) ? plan.scheduledAt : null,
+      alarmName: typeof plan.alarmName === 'string' && plan.alarmName ? plan.alarmName : AUTO_ALARM_NAME,
+    }
+    : null;
+  next.alarmName = typeof state.alarmName === 'string' && state.alarmName ? state.alarmName : AUTO_ALARM_NAME;
+  next.alarmFailedAt = Number.isFinite(state.alarmFailedAt) ? state.alarmFailedAt : null;
+  next.lastError = typeof state.lastError === 'string' ? state.lastError : null;
+  next.lastRunDateKey = typeof state.lastRunDateKey === 'string' ? state.lastRunDateKey : null;
+  next.lastRunStatus = typeof state.lastRunStatus === 'string' ? state.lastRunStatus : null;
+  next.lastRunAt = Number.isFinite(state.lastRunAt) ? state.lastRunAt : null;
+  next.lastResult = state.lastResult && typeof state.lastResult === 'object' ? clone(state.lastResult) : null;
+  next.retry = state.retry && typeof state.retry === 'object'
+    ? {
+      count: Number.isInteger(state.retry.count) && state.retry.count >= 0 ? state.retry.count : 0,
+      at: Number.isFinite(state.retry.at) ? state.retry.at : null,
+      nextRunAt: Number.isFinite(state.retry.nextRunAt) ? state.retry.nextRunAt : null,
+      reason: typeof state.retry.reason === 'string' ? state.retry.reason : null,
+    }
+    : null;
+  next.activeRunDateKey = typeof state.activeRunDateKey === 'string' ? state.activeRunDateKey : null;
+  next.activeRunStartedAt = Number.isFinite(state.activeRunStartedAt) ? state.activeRunStartedAt : null;
+  return next;
+};
+
 const loadAutoState = async () => {
   if (autoState) return autoState;
-  autoState = defaultAutoState();
+  const stored = await autoStorage.get(AUTO_STORAGE_KEY).catch(() => ({}));
+  autoState = normalizeAutoState(stored?.[AUTO_STORAGE_KEY]);
+  const todayKey = getLosAngelesDateKey();
+  let stateChanged = false;
+  if (autoState.plan && autoState.plan.dateKey !== todayKey) {
+    await clearAutoAlarmsForState(autoState);
+    autoState.plan = null;
+    autoState.activeRunDateKey = null;
+    autoState.retry = null;
+    if (autoState.enabled) {
+      autoState.enabled = false;
+      autoState.lastRunStatus = 'skipped-stale';
+      autoState.lastError = 'auto-plan-expired';
+    }
+    stateChanged = true;
+  }
+  if (autoState.enabled && !autoState.plan) {
+    await clearAutoAlarmsForState(autoState);
+    autoState.enabled = false;
+    autoState.activeRunDateKey = null;
+    autoState.activeRunStartedAt = null;
+    autoState.retry = null;
+    if (!autoState.lastError) autoState.lastError = 'auto-schedule-not-configured';
+    if (!autoState.lastRunStatus || autoState.lastRunStatus === 'scheduled') autoState.lastRunStatus = 'disabled';
+    stateChanged = true;
+  }
+  if (stateChanged) {
+    await autoStorage.set({ [AUTO_STORAGE_KEY]: autoState }).catch(() => {});
+  }
   return autoState;
 };
 
-const saveAutoState = async () => {};
-const hasAutoAlarm = async () => false;
+const saveAutoState = async () => {
+  await loadAutoState();
+  await autoStorage.set({ [AUTO_STORAGE_KEY]: autoState });
+  return autoState;
+};
+const hasAutoAlarm = async (name = AUTO_ALARM_NAME) => {
+  if (typeof chrome.alarms?.get !== 'function') return false;
+  const alarm = await chrome.alarms.get(name).catch(() => null);
+  return Boolean(alarm?.name === name);
+};
 
 const scheduleRuntimeFinalization = async (pending) => {
   if (!pending?.actionId || typeof chrome.alarms?.create !== 'function') {
@@ -603,7 +809,7 @@ const scheduleRuntimeFinalization = async (pending) => {
   }
   const alarmName = `${RUNTIME_FINALIZE_ALARM_PREFIX}${pending.actionId}`;
   try {
-    await chrome.alarms.create(alarmName, { when: Date.now() + 1 });
+    await chrome.alarms.create(alarmName, { when: Date.now() + RUNTIME_FINALIZE_ALARM_DELAY_MS });
     if (typeof chrome.alarms?.get === 'function') {
       const alarm = await chrome.alarms.get(alarmName);
       if (!alarm?.name) throw new Error('runtime-finalization-alarm-missing-after-create');
@@ -638,17 +844,36 @@ const scheduleRuntimeFinalization = async (pending) => {
   }
 };
 
-const inspectAutoAlarm = async () => ({ exists: false, matches: false, alarm: null });
+const inspectAutoAlarm = async () => {
+  await loadAutoState();
+  const alarmName = autoState?.plan?.alarmName || autoState?.alarmName || AUTO_ALARM_NAME;
+  if (typeof chrome.alarms?.get !== 'function') return { exists: false, matches: false, alarm: null };
+  const alarm = await chrome.alarms.get(alarmName).catch(() => null);
+  const expectedAt = Number.isFinite(autoState?.plan?.nextRunAt) ? autoState.plan.nextRunAt : null;
+  const matches = Boolean(alarm?.name === alarmName)
+    && (!expectedAt || !Number.isFinite(alarm.scheduledTime) || Math.abs(alarm.scheduledTime - expectedAt) < 5000);
+  return { exists: Boolean(alarm?.name), matches, alarm: alarm || null };
+};
 
-const getAutoStatePayload = async () => ({
-  enabled: false,
-  status: 'disabled',
-  todayStatus: 'disabled',
-  lastResult: null,
-  currentRun: null,
-  runEvents: [],
-  runtimeDiagnostics: collectRuntimeDiagnostics(),
-});
+const getAutoStatePayload = async () => {
+  await loadAutoState();
+  await loadRuntimeState();
+  const run = getRunState();
+  const todayKey = getLosAngelesDateKey();
+  const activeToday = autoState.activeRunDateKey === todayKey;
+  return {
+    enabled: Boolean(autoState.enabled),
+    status: autoState.enabled ? (activeToday ? 'running' : (autoState.lastRunStatus || 'scheduled')) : 'disabled',
+    todayStatus: activeToday ? (autoState.lastRunStatus || 'running') : (autoState.lastRunDateKey === todayKey ? (autoState.lastRunStatus || 'idle') : 'not-started'),
+    lastResult: autoState.lastResult || null,
+    currentRun: run.runId && run.laDateKey === todayKey ? run : null,
+    plan: autoState.plan || null,
+    alarm: await inspectAutoAlarm(),
+    lastError: autoState.lastError || null,
+    runEvents: Array.isArray(run.events) ? run.events : [],
+    runtimeDiagnostics: collectRuntimeDiagnostics(),
+  };
+};
 
 const syncActionIcon = async (enabled) => {
   if (typeof chrome.action?.setIcon !== 'function') return false;
@@ -666,18 +891,226 @@ const syncActionIconFromState = async () => {
 // guaranteed to run after the manifest restores the default toolbar icon.
 syncActionIconFromState().catch(() => {});
 
-const clearAutoAlarm = async () => {};
-const setAutoState = async () => defaultAutoState();
-const scheduleAutoAlarm = async () => false;
-const ensurePersistedAutoAlarm = async () => false;
-const resyncAutoSchedule = async () => defaultAutoState();
-const disableAutoSchedule = async () => defaultAutoState();
-const enableAutoSchedule = async () => defaultAutoState();
-const completeAutoRun = async () => {};
-const scheduleSameDayAutoRetry = async () => defaultAutoState();
-const pauseAutoRunForLogin = async () => defaultAutoState();
-const finalizeAutoRunFailure = async () => defaultAutoState();
-const handleAutoQuestionStartupFailure = async () => false;
+const clearAutoAlarm = async () => {
+  return clearAutoAlarmsForState(autoState);
+};
+
+const setAutoState = async (patch = {}) => {
+  await loadAutoState();
+  autoState = normalizeAutoState({ ...autoState, ...patch });
+  await saveAutoState();
+  await syncActionIcon(Boolean(autoState.enabled)).catch(() => {});
+  return autoState;
+};
+
+const scheduleAutoAlarm = async ({ plan = autoState?.plan } = {}) => {
+  await loadAutoState();
+  if (!autoState.enabled || !plan || !Number.isFinite(plan.nextRunAt)) return false;
+  if (typeof chrome.alarms?.create !== 'function') {
+    autoState.alarmFailedAt = Date.now();
+    autoState.lastError = 'alarms-api-unavailable';
+    await saveAutoState().catch(() => {});
+    return false;
+  }
+  const alarmName = plan.alarmName || autoState.alarmName || AUTO_ALARM_NAME;
+  const when = Math.max(Date.now() + AUTO_ALARM_MIN_DELAY_MS, plan.nextRunAt);
+  try {
+    await chrome.alarms.create(alarmName, { when });
+    autoState.alarmName = alarmName;
+    autoState.alarmFailedAt = null;
+    autoState.lastError = null;
+    await saveAutoState();
+    return true;
+  } catch (error) {
+    autoState.alarmFailedAt = Date.now();
+    autoState.lastError = error?.message || 'alarm-create-failed';
+    await saveAutoState().catch(() => {});
+    return false;
+  }
+};
+
+const ensurePersistedAutoAlarm = async () => {
+  await loadAutoState();
+  if (!autoState.enabled || !autoState.plan) return false;
+  const todayKey = getLosAngelesDateKey();
+  if (autoState.lastRunDateKey === todayKey && ['completed', 'failed', 'login-blocked', 'disabled', 'started'].includes(autoState.lastRunStatus)) {
+    return false;
+  }
+  const inspection = await inspectAutoAlarm();
+  if (inspection.matches) return true;
+  return scheduleAutoAlarm({ plan: autoState.plan });
+};
+
+const resyncAutoSchedule = async ({ now = new Date() } = {}) => {
+  await loadAutoState();
+  if (!autoState.enabled) return autoState;
+  const todayKey = getLosAngelesDateKey(now);
+  if (autoState.lastRunDateKey === todayKey && autoState.lastRunStatus === 'started') {
+    return autoState;
+  }
+  if (autoState.lastRunDateKey === todayKey && ['completed', 'failed', 'login-blocked', 'disabled'].includes(autoState.lastRunStatus)) {
+    await clearAutoAlarm();
+    autoState.enabled = false;
+    await saveAutoState();
+    await syncActionIcon(false).catch(() => {});
+    return autoState;
+  }
+  if (!autoState.plan || autoState.plan.dateKey !== todayKey || !Number.isFinite(autoState.plan.nextRunAt)) {
+    await clearAutoAlarm();
+    autoState.enabled = false;
+    autoState.plan = null;
+    autoState.activeRunDateKey = null;
+    autoState.retry = null;
+    autoState.lastRunStatus = 'disabled';
+    autoState.lastError = 'auto-schedule-not-configured';
+    await saveAutoState();
+    await syncActionIcon(false).catch(() => {});
+    return autoState;
+  }
+  const scheduled = await scheduleAutoAlarm({ plan: autoState.plan });
+  if (!scheduled) {
+    await clearAutoAlarm();
+    autoState.enabled = false;
+    autoState.lastRunStatus = 'disabled';
+    autoState.lastError = autoState.lastError || 'alarm-create-failed';
+    await saveAutoState();
+    await syncActionIcon(false).catch(() => {});
+  }
+  return autoState;
+};
+
+const disableAutoSchedule = async () => {
+  await loadAutoState();
+  await clearAutoAlarm();
+  autoState.enabled = false;
+  autoState.activeRunDateKey = null;
+  autoState.activeRunStartedAt = null;
+  autoState.retry = null;
+  autoState.lastRunStatus = 'disabled';
+  autoState.lastError = null;
+  await saveAutoState();
+  await syncActionIcon(false).catch(() => {});
+  return autoState;
+};
+
+const enableAutoSchedule = async ({ plan = null } = {}) => {
+  await loadAutoState();
+  const candidate = plan || autoState.plan;
+  if (!candidate || typeof candidate !== 'object' || !candidate.dateKey || !Number.isFinite(candidate.nextRunAt)) {
+    await clearAutoAlarm();
+    autoState.enabled = false;
+    autoState.lastError = 'auto-schedule-not-configured';
+    autoState.lastRunStatus = 'disabled';
+    await saveAutoState();
+    await syncActionIcon(false).catch(() => {});
+    return autoState;
+  }
+  const todayKey = getLosAngelesDateKey();
+  if (candidate.dateKey !== todayKey) {
+    await clearAutoAlarm();
+    autoState.enabled = false;
+    autoState.plan = null;
+    autoState.activeRunDateKey = null;
+    autoState.activeRunStartedAt = null;
+    autoState.retry = null;
+    autoState.lastError = 'auto-plan-expired';
+    autoState.lastRunStatus = 'skipped-stale';
+    await saveAutoState();
+    await syncActionIcon(false).catch(() => {});
+    return autoState;
+  }
+  autoState.plan = {
+    dateKey: candidate.dateKey,
+    nextRunAt: candidate.nextRunAt,
+    scheduledAt: Number.isFinite(candidate.scheduledAt) ? candidate.scheduledAt : Date.now(),
+    alarmName: candidate.alarmName || AUTO_ALARM_NAME,
+  };
+  autoState.enabled = true;
+  autoState.lastError = null;
+  await saveAutoState();
+  const scheduled = await scheduleAutoAlarm({ plan: autoState.plan });
+  if (!scheduled) autoState.enabled = false;
+  await saveAutoState();
+  await syncActionIcon(Boolean(autoState.enabled)).catch(() => {});
+  return autoState;
+};
+
+const completeAutoRun = async ({ status = 'completed', now = new Date(), result = null } = {}) => {
+  await loadAutoState();
+  const todayKey = getLosAngelesDateKey(now);
+  autoState.lastRunDateKey = todayKey;
+  autoState.lastRunStatus = status;
+  autoState.lastRunAt = now.getTime();
+  autoState.activeRunDateKey = null;
+  autoState.activeRunStartedAt = null;
+  autoState.retry = null;
+  autoState.enabled = false;
+  await clearAutoAlarm();
+  if (result) autoState.lastResult = result;
+  await saveAutoState();
+  await syncActionIcon(false).catch(() => {});
+  return autoState;
+};
+
+const scheduleSameDayAutoRetry = async ({ pending = null, result = null, now = new Date() } = {}) => {
+  await loadAutoState();
+  const todayKey = getLosAngelesDateKey(now);
+  if (!autoState.enabled || autoState.activeRunDateKey !== todayKey) return autoState;
+  const count = Number.isInteger(autoState.retry?.count) ? autoState.retry.count + 1 : 1;
+  const nextRunAt = now.getTime() + AUTO_RECOVERY_RETRY_DELAY_MS;
+  autoState.retry = { count, at: now.getTime(), nextRunAt, reason: result?.reason || result?.status || null };
+  autoState.lastRunStatus = 'retry-scheduled';
+  autoState.lastResult = createAutoResultDetails({ pending, status: result?.status || 'failed', reason: result?.reason || null, phase: pending?.action || 'start', now, retryable: true, willRetry: true, message: '稍后重试' });
+  await saveAutoState();
+  if (typeof chrome.alarms?.create === 'function') {
+    await chrome.alarms.create(`${AUTO_RETRY_ALARM_PREFIX}${todayKey}`, { when: nextRunAt }).catch(() => {});
+  }
+  return autoState;
+};
+
+const pauseAutoRunForLogin = async ({ pending = null, result = null, now = new Date() } = {}) => {
+  await loadAutoState();
+  autoState.lastRunStatus = 'login-blocked';
+  autoState.lastRunDateKey = getLosAngelesDateKey(now);
+  autoState.lastRunAt = now.getTime();
+  autoState.lastError = result?.reason || 'requires-login';
+  autoState.lastResult = createAutoResultDetails({ pending, status: result?.status || 'login-blocked', reason: result?.reason || 'requires-login', phase: pending?.action || 'unknown', now, retryable: false, willRetry: false, message: '需要登录' });
+  autoState.activeRunDateKey = null;
+  autoState.retry = null;
+  autoState.enabled = false;
+  await clearAutoAlarm();
+  await saveAutoState();
+  await syncActionIcon(false).catch(() => {});
+  return autoState;
+};
+
+const finalizeAutoRunFailure = async ({ pending = null, result = null, now = new Date() } = {}) => {
+  await loadAutoState();
+  autoState.lastRunStatus = 'failed';
+  autoState.lastRunDateKey = getLosAngelesDateKey(now);
+  autoState.lastRunAt = now.getTime();
+  autoState.lastError = result?.reason || result?.status || 'auto-run-failed';
+  autoState.lastResult = createAutoResultDetails({ pending, status: result?.status || 'failed', reason: result?.reason || null, phase: pending?.action || 'unknown', now, retryable: false, willRetry: false, message: '自动任务已停止，需要人工处理' });
+  autoState.activeRunDateKey = null;
+  autoState.retry = null;
+  autoState.enabled = false;
+  await clearAutoAlarm();
+  await saveAutoState();
+  await syncActionIcon(false).catch(() => {});
+  return autoState;
+};
+
+const handleAutoQuestionStartupFailure = async ({ workflowId = null, error = null, now = new Date(), random = Math.random } = {}) => {
+  await loadAutoState();
+  const failure = { status: 'failed', reason: 'question-tab-start-failed', error: error?.message || String(error || '') };
+  const classification = classifyAutoFailure(failure, { workflowId, action: 'question' });
+  if (classification.retryable && (Number.isInteger(autoState.retry?.count) ? autoState.retry.count : 0) < AUTO_RECOVERY_RETRY_LIMIT) {
+    await scheduleSameDayAutoRetry({ pending: { workflowId, action: 'question' }, result: failure, now });
+    return true;
+  }
+  await finalizeAutoRunFailure({ pending: { workflowId, action: 'question' }, result: failure, now, random });
+  return false;
+};
 
 const persistQuestionRunFailureState = async ({ error = null, status = 'paused', transition = 'question' } = {}) => {
   runtimeState.run.status = status;
@@ -689,7 +1122,56 @@ const persistQuestionRunFailureState = async ({ error = null, status = 'paused',
   await saveRuntimeState().catch(() => {});
 };
 
-const consumeAutoPlanForToday = async () => ({ ok: false, reason: 'disabled' });
+const createAutoResultDetails = ({ pending = null, status = null, reason = null, phase = null, now = new Date(), retryable = false, willRetry = false, message = null } = {}) => ({
+  dateKey: getLosAngelesDateKey(now),
+  at: now.getTime(),
+  phase: phase || pending?.action || null,
+  actionId: typeof pending?.actionId === 'string' ? pending.actionId : null,
+  tabId: Number.isInteger(pending?.tabId) ? pending.tabId : null,
+  status: status || 'failed',
+  reason: reason || null,
+  retryable: retryable === true,
+  willRetry: willRetry === true,
+  message: message || null,
+});
+
+const classifyAutoFailure = (result = {}, pending = null) => {
+  const status = typeof result?.status === 'string' ? result.status : null;
+  const reason = typeof result?.reason === 'string' ? result.reason : null;
+  if (status === 'login-blocked' || reason === 'requires-login') return { retryable: false, pause: 'login', status, reason, pending };
+  if (AUTO_NON_RETRYABLE_REASONS.has(status) || AUTO_NON_RETRYABLE_REASONS.has(reason)) return { retryable: false, pause: 'manual', status, reason, pending };
+  const retryable = AUTO_RECOVERABLE_REASONS.has(status) || AUTO_RECOVERABLE_REASONS.has(reason);
+  return { retryable, pause: retryable ? null : 'manual', status, reason, pending };
+};
+
+const consumeAutoPlanForToday = async ({ now = new Date() } = {}) => {
+  await loadAutoState();
+  const todayKey = getLosAngelesDateKey(now);
+  if (!autoState.enabled) return { ok: false, reason: 'auto-disabled' };
+  if (!autoState.plan || autoState.plan.dateKey !== todayKey) {
+    await finalizeAutoRunFailure({ pending: { action: 'everything' }, result: { status: 'disabled', reason: 'auto-schedule-not-configured' }, now });
+    return { ok: false, reason: 'auto-schedule-not-configured' };
+  }
+  if (autoState.lastRunDateKey === todayKey && autoState.lastRunStatus === 'started') {
+    return { ok: false, reason: 'already-running' };
+  }
+  if (autoState.lastRunDateKey === todayKey && ['completed', 'failed', 'login-blocked', 'disabled'].includes(autoState.lastRunStatus)) {
+    return { ok: false, reason: 'already-finished' };
+  }
+  if (Number.isFinite(autoState.plan.nextRunAt) && autoState.plan.nextRunAt > now.getTime()) {
+    return { ok: false, reason: 'not-due', nextRunAt: autoState.plan.nextRunAt };
+  }
+  autoState.activeRunDateKey = todayKey;
+  autoState.activeRunStartedAt = now.getTime();
+  autoState.lastRunDateKey = todayKey;
+  autoState.lastRunStatus = 'started';
+  autoState.lastRunAt = now.getTime();
+  autoState.lastError = null;
+  autoState.retry = null;
+  await clearAutoAlarm();
+  await saveAutoState();
+  return { ok: true, dateKey: todayKey };
+};
 
 const getActionRecord = (tabId) => runtimeState?.actionsByTabId[String(tabId)] || null;
 const getAwaitingRecord = (tabId) => runtimeState?.awaitingContentByTabId[String(tabId)] || null;
@@ -705,29 +1187,15 @@ const isSuccessResult = (result) => result?.status === 'success';
 const isExistingTabId = async (tabId) => {
   if (!Number.isInteger(tabId)) return false;
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  return Boolean(tab?.id);
+  return Number.isInteger(tab?.id);
 };
 
 const isTabAlreadyGone = async (tabId) => {
   if (!Number.isInteger(tabId)) return true;
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  return !tab?.id;
+  return !Number.isInteger(tab?.id);
 };
 
-const waitForTabToSettleInactive = async (tabId, { attempts = 5, delayMs = 50 } = {}) => {
-  if (!Number.isInteger(tabId)) return null;
-  let lastTab = null;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tab) return null;
-    lastTab = tab;
-    if (tab.active !== true) return tab;
-    if (attempt < attempts - 1) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-  return lastTab;
-};
 const waitForTabUrl = async (tabId, expectedUrl, { attempts = 8, delayMs = 75 } = {}) => {
   if (!Number.isInteger(tabId) || !expectedUrl) return null;
   let lastTab = null;
@@ -823,6 +1291,19 @@ const closeActionTabSafely = async (tabId, pending = null) => {
     });
     return false;
   }
+  const explicitlyOwned = record.createdByExtension === true && record.reusedExistingTab !== true;
+  const explicitWorkflowClose = pending.allowReusedTabClose === true
+    || Boolean(record.workflowId && record.workflowId === pending.workflowId)
+    || Boolean(runtimeState.run?.mode === 'everything' && runtimeState.run.currentActionId === record.actionId);
+  if (!explicitlyOwned && !explicitWorkflowClose) {
+    await updateFinalizationDiagnostics(tabId, pending, {
+      closeStatus: 'skipped',
+      closeSkippedReason: 'unowned-tab',
+      closeSkippedDetail: 'tab-was-reused-or-user-owned',
+      finalizationError: null,
+    });
+    return false;
+  }
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) {
     await updateFinalizationDiagnostics(tabId, pending, {
@@ -897,6 +1378,9 @@ const closeActionTabSafely = async (tabId, pending = null) => {
     finalizationError: null,
   });
   try {
+    if (refreshedTab.active === true) {
+      await restoreOriginIfTaskTabStoleFocus(tabId, pending.originActiveTabId ?? latest.originActiveTabId ?? runtimeState.run?.originActiveTabId);
+    }
     await chrome.tabs.remove(tabId);
     return true;
   } catch (error) {
@@ -937,13 +1421,13 @@ const promoteOrCreateQuestionTabAfterCloseFailure = async (pending, inheritedFin
   if (typeof chrome.tabs?.create !== 'function') {
     throw new Error('tabs-create-unavailable');
   }
-  const questionTab = await chrome.tabs.create({ url: questionUrl, active: false });
+  const questionTab = await createBackgroundTaskTab(questionUrl, pending.originActiveTabId ?? runtimeState.run.originActiveTabId ?? null);
   return { ok: true, tabId: questionTab.id, mode: 'created' };
 };
 
 const setActionRecord = async (tabId, record) => {
   await loadRuntimeState();
-  const next = { ...record, tabId };
+  const next = { ...record, tabId, dateKey: record?.dateKey || runtimeState.run?.laDateKey || getLosAngelesDateKey() };
   runtimeState.actionsByTabId[String(tabId)] = next;
   delete runtimeState.awaitingContentByTabId[String(tabId)];
   if (next.actionId) delete runtimeState.pendingActionsById[next.actionId];
@@ -979,12 +1463,33 @@ const clearActionArtifactsIfFinalized = async (tabId, pending) => {
   return true;
 };
 
+const finalizeStandaloneCheckin = async (pending) => {
+  if (!pending || pending.action !== 'checkin' || pending.workflowId) return false;
+  const closed = await closeActionTabSafely(pending.tabId, pending);
+  const missing = await isTabAlreadyGone(pending.tabId);
+  if (!closed && !missing) return false;
+  await clearActionArtifactsIfFinalized(pending.tabId, pending).catch(() => {});
+  await loadRuntimeState();
+  const currentRun = getRunState();
+  runtimeState.run = {
+    ...defaultRuntimeState().run,
+    status: 'idle',
+    events: Array.isArray(currentRun.events) ? currentRun.events : [],
+  };
+  await saveRuntimeState();
+  if (typeof chrome.action?.setBadgeText === 'function') chrome.action.setBadgeText({ text: '' }).catch(() => {});
+  await showCoordinatorNotification('签到完成');
+  return true;
+};
+
 // A completed check-in is an intermediate success, never the end of the
 // one-click run. This recovery path is deliberately independent of the
 // original message event: an MV3 worker can be reclaimed after the check-in
 // tab disappears and before the normal finalizer creates the question tab.
 const recoverCompletedCheckinToQuestion = async (pending, { isAutoRun = false, source = 'recoverCompletedActionFinalization' } = {}) => {
   if (!pending || pending.action !== 'checkin' || pending.workflowId) return false;
+  await loadRuntimeState();
+  if (runtimeState.run?.mode === 'checkin') return false;
   const inheritedFinalizationError = typeof pending.finalizationError === 'string' && pending.finalizationError
     ? pending.finalizationError
     : null;
@@ -999,11 +1504,8 @@ const recoverCompletedCheckinToQuestion = async (pending, { isAutoRun = false, s
     });
     const originActiveTabId = await captureOriginActiveTabId();
     const questionUrl = actionPage('question');
-    const existingQuestionTab = await findExistingTaskTab(questionUrl);
-    const questionTab = existingQuestionTab || (typeof chrome.tabs?.create === 'function'
-      ? await chrome.tabs.create({ url: questionUrl, active: false })
-      : null);
-    if (!questionTab) throw new Error('tabs-create-unavailable');
+    const existingQuestionTab = await findExistingTaskTab(questionUrl, { workflow: true });
+    const questionTab = existingQuestionTab || await createBackgroundTaskTab(questionUrl, originActiveTabId);
     const questionActionId = crypto.randomUUID();
     await createCoordinatorActionRecord({
       tabId: questionTab.id,
@@ -1097,6 +1599,7 @@ const recoverCompletedActionFinalization = async (pending, { now = new Date(), r
   const tabExists = await chrome.tabs.get(pending.tabId).then(() => true).catch(() => false);
   const isAutoRun = run.source === 'auto' || Boolean(autoState?.enabled && autoState.activeRunDateKey && run.laDateKey === autoState.activeRunDateKey);
   if (pending.action === 'checkin' && !pending.workflowId) {
+    if (inferRunMode(run, pending) !== 'everything') return finalizeStandaloneCheckin(pending);
     if (tabExists) {
       const closed = await closeActionTabSafely(pending.tabId, pending);
       const missing = pending.createdByExtension === true ? await isTabAlreadyGone(pending.tabId) : false;
@@ -1129,23 +1632,6 @@ const recoverCompletedActionFinalization = async (pending, { now = new Date(), r
     await completeAutoRun({ status: 'completed', now, random });
   }
   return true;
-};
-
-const scanPendingActionDeliveries = async () => {
-  await loadRuntimeState();
-  const tabIds = new Set([
-    ...Object.keys(runtimeState.actionsByTabId || {}),
-    ...Object.keys(runtimeState.awaitingContentByTabId || {}),
-  ]);
-  for (const tabIdValue of tabIds) {
-    const tabId = Number(tabIdValue);
-    if (!Number.isInteger(tabId)) continue;
-    const record = getActionRecord(tabId) || getAwaitingRecord(tabId);
-    if (!record || record.status !== 'pending') continue;
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tab?.url || !isTargetUrl(tab.url, actionPage(record.action))) continue;
-    await retryDeliverIfNeeded(tabId).catch(() => {});
-  }
 };
 
 const recoverAutoWorkflowProgress = async ({ now = new Date(), random = Math.random } = {}) => {
@@ -1285,6 +1771,7 @@ const createCoordinatorActionRecord = async ({
     actionId,
     workflowId,
     tabId,
+    dateKey: runtimeState.run?.laDateKey || getLosAngelesDateKey(),
     originActiveTabId,
     status: 'pending',
     deliveredAt: null,
@@ -1319,7 +1806,7 @@ const openCoordinatorActionTab = async ({ action, actionId, workflowId = null, s
   runtimeState.run.currentActionId = actionId;
   await saveRuntimeState();
   await pushRunEvent('tab-opening', { action, actionId, manual, source, at: now.getTime() });
-  const tab = await chrome.tabs.create({ url: page, active: false });
+  const tab = await createBackgroundTaskTab(page, runtimeState.run.originActiveTabId ?? null);
   await createCoordinatorActionRecord({ tabId: tab.id, action, actionId, workflowId, createdByExtension: true, reusedExistingTab: false, originActiveTabId: runtimeState.run.originActiveTabId ?? null });
   await pushRunEvent('tab-created', { tabId: tab.id, action, actionId, manual, at: now.getTime() });
   await saveRuntimeState();
@@ -1395,6 +1882,7 @@ const promoteCheckinTabToQuestion = async (pending) => {
     actionId: nextActionId,
     workflowId: pending.workflowId,
     tabId: pending.tabId,
+    dateKey: runtimeState.run?.laDateKey || getLosAngelesDateKey(),
     originActiveTabId: current.originActiveTabId ?? null,
     status: 'pending',
     deliveredAt: null,
@@ -1635,7 +2123,7 @@ const openActionPage = async (action, workflowId = null) => {
   await reserveActionRecord({ ...actionRecord, tabId: null });
   try {
     if (typeof chrome.tabs?.create !== 'function') throw new Error('tabs-create-unavailable');
-    target = await chrome.tabs.create({ url: page, active: false });
+    target = await createBackgroundTaskTab(page, originActiveTabId);
     await setActionRecord(target.id, actionRecord);
   } catch (error) {
     await loadRuntimeState();
@@ -1650,14 +2138,54 @@ const openActionPage = async (action, workflowId = null) => {
 const coordinatorStart = async ({ action, source, manual = false, now = new Date() } = {}) => coordinatorQueue(async () => {
   const requestAction = normalizeCoordinatorAction(action);
   if (!isCoordinatorAction(requestAction)) throw new Error('unknown-action');
+  const requestedMode = action === 'everything' ? 'everything' : requestAction;
   await loadRuntimeState();
   const originActiveTabId = await captureOriginActiveTabId();
   await cleanupAllButCurrentDailyTab();
   await loadRuntimeState();
   const todayKey = getLosAngelesDateKey(now);
-  const existingRun = runtimeState.run?.runId && runtimeState.run.laDateKey === todayKey ? runtimeState.run : null;
+  let existingRun = runtimeState.run?.runId && runtimeState.run.laDateKey === todayKey ? runtimeState.run : null;
+  const existingRecord = Number.isInteger(existingRun?.currentTabId)
+    ? getActionRecord(existingRun.currentTabId) || getAwaitingRecord(existingRun.currentTabId)
+    : null;
+  const existingMode = existingRun ? (existingRun.mode || inferRunMode(existingRun, existingRecord)) : null;
+  const canStartIndependentStage = Boolean(
+    existingRun
+    && existingMode !== 'everything'
+    && ['checkin', 'question'].includes(requestedMode)
+    && requestedMode !== existingMode
+    && existingRun.status !== 'running'
+    && (!existingRecord || existingRecord.status === 'completed')
+  );
+  if (canStartIndependentStage) {
+    // A paused standalone stage must not swallow a later standalone request
+    // for the other page. Keep the old records for diagnostics, but give the
+    // new action a fresh current-run lease and tab selection.
+    runtimeState.run = {
+      ...defaultRuntimeState(todayKey).run,
+      events: Array.isArray(existingRun.events) ? existingRun.events : [],
+    };
+    await saveRuntimeState();
+    existingRun = null;
+  }
+  if (existingRun && requestedMode === 'everything' && existingMode !== 'everything') {
+    runtimeState.run.mode = 'everything';
+    if (['paused', 'idle'].includes(runtimeState.run.status)) runtimeState.run.status = 'running';
+    await saveRuntimeState();
+    existingRun = runtimeState.run;
+  } else if (existingRun && ['paused', 'idle'].includes(existingRun.status)) {
+    runtimeState.run.status = 'running';
+    runtimeState.run.lastError = null;
+    await saveRuntimeState();
+    existingRun = runtimeState.run;
+  }
   const effectiveAction = existingRun?.stage && isCoordinatorAction(existingRun.stage) ? existingRun.stage : requestAction;
-  const run = existingRun || await ensureCoordinatorRun({ action: effectiveAction, source, now });
+  const effectiveMode = existingRun?.mode || requestedMode;
+  const run = existingRun || await ensureCoordinatorRun({ action: effectiveAction, source, mode: effectiveMode, now });
+  if (run.mode !== effectiveMode) {
+    runtimeState.run.mode = effectiveMode;
+    await saveRuntimeState();
+  }
   if (Number.isInteger(originActiveTabId) && !Number.isInteger(runtimeState.run.originActiveTabId)) {
     runtimeState.run.originActiveTabId = originActiveTabId;
     await saveRuntimeState();
@@ -1668,7 +2196,24 @@ const coordinatorStart = async ({ action, source, manual = false, now = new Date
     ? getActionRecord(runtimeState.run.currentTabId) || getAwaitingRecord(runtimeState.run.currentTabId)
     : null;
   if (
-    !current?.id
+    action === 'everything'
+    && runtimeState.run.mode === 'checkin'
+    && currentRecord?.action === 'checkin'
+    && currentRecord.status === 'completed'
+    && currentRecord.finalizationPending === true
+    && isSuccessResult(currentRecord.lastResult)
+    && runtimeState.run.currentActionId === currentRecord.actionId
+  ) {
+    // A standalone check-in may be complete while its reused user tab cannot
+    // be closed. An explicit later "everything" request is allowed to opt
+    // into the workflow and continue with a separate question tab.
+    runtimeState.run.mode = 'everything';
+    await saveRuntimeState();
+    const advanced = await recoverCompletedCheckinToQuestion(currentRecord, { isAutoRun: false, source: 'coordinatorStart-upgrade-to-everything' });
+    if (advanced) return { tab: { id: runtimeState.run.currentTabId }, run: runtimeState.run, transitionPending: true };
+  }
+  if (
+    !Number.isInteger(current?.id)
     && currentRecord?.action === 'checkin'
     && currentRecord.status === 'completed'
     && currentRecord.finalizationPending === true
@@ -1681,7 +2226,7 @@ const coordinatorStart = async ({ action, source, manual = false, now = new Date
     recoverRemovedCompletedCheckin(currentRecord.tabId).catch((error) => setRunError(error, 'start-during-removed-checkin-transition-failed'));
     return { tab: { id: currentRecord.tabId }, run: runtimeState.run, transitionPending: true };
   }
-  if (current?.id && isTargetUrl(current.url, page)) {
+  if (Number.isInteger(current?.id) && isTargetUrl(current.url, page)) {
     const actionId = runtimeState.run.currentActionId || crypto.randomUUID();
     runtimeState.run.stage = effectiveAction;
     runtimeState.run.transition = 'reconcile';
@@ -1693,7 +2238,7 @@ const coordinatorStart = async ({ action, source, manual = false, now = new Date
     await retryDeliverIfNeeded(current.id, { force: true, manual }).catch((error) => setRunError(error, 'deliver-current-failed'));
     return { tab: { id: current.id }, run: runtimeState.run };
   }
-  if (current?.id && runtimeState.run.stage === 'question' && isTargetUrl(current.url, ExtensionProtocol.PAGE_URLS.dailyCheckin)) {
+  if (Number.isInteger(current?.id) && runtimeState.run.stage === 'question' && isTargetUrl(current.url, ExtensionProtocol.PAGE_URLS.dailyCheckin)) {
     const actionId = runtimeState.run.currentActionId || crypto.randomUUID();
     runtimeState.run.currentTabId = current.id;
     runtimeState.run.currentActionId = actionId;
@@ -1707,8 +2252,15 @@ const coordinatorStart = async ({ action, source, manual = false, now = new Date
     await retryDeliverIfNeeded(current.id, { force: true, manual }).catch((error) => setRunError(error, 'deliver-current-failed'));
     return { tab: { id: current.id }, run: runtimeState.run };
   }
-  const existing = await findExistingTaskTab(page);
+  const existing = await findExistingTaskTab(page, { workflow: requestedMode === 'everything' });
   if (existing?.id != null) {
+    const previousRecord = getActionRecord(existing.id) || getAwaitingRecord(existing.id);
+    const createdByExtension = previousRecord
+      ? previousRecord.createdByExtension === true
+      : false;
+    const reusedExistingTab = previousRecord
+      ? previousRecord.reusedExistingTab === true
+      : true;
     const actionId = runtimeState.run.currentActionId || crypto.randomUUID();
     runtimeState.run.currentTabId = existing.id;
     runtimeState.run.stage = effectiveAction;
@@ -1716,7 +2268,7 @@ const coordinatorStart = async ({ action, source, manual = false, now = new Date
     runtimeState.run.transition = 'reconcile';
     if (Number.isInteger(originActiveTabId) && !Number.isInteger(runtimeState.run.originActiveTabId)) runtimeState.run.originActiveTabId = originActiveTabId;
     await saveRuntimeState();
-    await createCoordinatorActionRecord({ tabId: existing.id, action: effectiveAction, actionId, createdByExtension: false, reusedExistingTab: true, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId });
+    await createCoordinatorActionRecord({ tabId: existing.id, action: effectiveAction, actionId, createdByExtension, reusedExistingTab, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId });
     await retryDeliverIfNeeded(existing.id, { force: true, manual }).catch((error) => setRunError(error, 'deliver-reused-failed'));
     return { tab: { id: existing.id }, run: runtimeState.run };
   }
@@ -1728,7 +2280,7 @@ const coordinatorStart = async ({ action, source, manual = false, now = new Date
   if (Number.isInteger(originActiveTabId) && !Number.isInteger(runtimeState.run.originActiveTabId)) runtimeState.run.originActiveTabId = originActiveTabId;
   await saveRuntimeState();
   await pushRunEvent('tab-opening', { action: effectiveAction, actionId, manual, source, at: now.getTime() });
-  const tab = await chrome.tabs.create({ url: page, active: false });
+  const tab = await createBackgroundTaskTab(page, runtimeState.run.originActiveTabId ?? originActiveTabId);
   await createCoordinatorActionRecord({ tabId: tab.id, action: effectiveAction, actionId, createdByExtension: true, reusedExistingTab: false, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId });
   await pushRunEvent('tab-created', { tabId: tab.id, action: effectiveAction, actionId, manual, at: now.getTime() });
   await saveRuntimeState();
@@ -1792,6 +2344,7 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
       ...defaultRuntimeState().run,
       runId: run.runId || workflow?.workflowId || record.workflowId || record.actionId || `recovered-${tabId}`,
       laDateKey: run.laDateKey || getLosAngelesDateKey(new Date()),
+      mode: inferRunMode(run, record),
       source: run.source || 'manual',
       stage: record.action === 'question' ? 'question' : 'checkin',
       status: 'running',
@@ -1836,8 +2389,8 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
   runtimeState.run.transition = 'finalizing';
   if (!success) runtimeState.run.lastError = reason || status;
   await pushRunEvent('action-result', { tabId, status, reason, action: result?.action, source });
-  const retainedStatuses = new Set(['login-blocked', 'captcha-required', 'captcha-error', 'question-unmatched', 'answer-option-ambiguous', 'default-option-not-found']);
-  const retainedReasons = new Set(['requires-login', 'captcha-required', 'captcha-error', 'question-unmatched', 'answer-option-ambiguous', 'default-option-not-found']);
+  const retainedStatuses = new Set(['login-blocked', 'captcha-required', 'captcha-error', 'question-unmatched', 'answer-not-visible', 'answer-option-ambiguous', 'question-fuzzy-match-requires-confirmation', 'default-option-not-found']);
+  const retainedReasons = new Set(['requires-login', 'captcha-required', 'captcha-error', 'question-unmatched', 'answer-not-visible', 'answer-option-ambiguous', 'question-fuzzy-match-requires-confirmation', 'default-option-not-found']);
   if (!success) {
     const nextRecord = {
       ...record,
@@ -1864,7 +2417,7 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
       autoState.lastResult = createAutoResultDetails({ pending: record, status: 'completed', reason: null, phase: 'checkin', now: new Date(), retryable: false, willRetry: false, message: 'checkin 成功' });
       await saveAutoState();
     }
-    return { ok: true, accepted: true, finalizationScheduled, finalize: { kind: 'checkin-success', tabId, actionId: record.actionId, runId: activeRun.runId, stage: 'checkin', workflowId: record.workflowId, createdByExtension: record.createdByExtension === true, reusedExistingTab: record.reusedExistingTab === true } };
+    return { ok: true, accepted: true, finalizationScheduled, finalize: { kind: 'checkin-success', tabId, actionId: record.actionId, runId: activeRun.runId, stage: 'checkin', mode: activeRun.mode || (record.workflowId ? 'everything' : record.action), workflowId: record.workflowId, createdByExtension: record.createdByExtension === true, reusedExistingTab: record.reusedExistingTab === true } };
   }
   if (success && result?.action === 'question') {
     runtimeState.actionsByTabId[String(tabId)] = { ...record, status: 'completed', lastResult: { ...result }, finalizationPending: true };
@@ -1879,17 +2432,17 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
       autoState.lastResult = createAutoResultDetails({ pending: record, status: 'completed', reason: null, phase: 'question', now: new Date(), retryable: false, willRetry: false, message: '今日已完成' });
       await saveAutoState();
     }
-    return { ok: true, accepted: true, finalizationScheduled, finalize: { kind: 'question-success', tabId, actionId: record.actionId, runId: activeRun.runId, stage: 'question', workflowId: record.workflowId, createdByExtension: record.createdByExtension === true, reusedExistingTab: record.reusedExistingTab === true } };
+    return { ok: true, accepted: true, finalizationScheduled, finalize: { kind: 'question-success', tabId, actionId: record.actionId, runId: activeRun.runId, stage: 'question', mode: activeRun.mode || (record.workflowId ? 'everything' : record.action), workflowId: record.workflowId, createdByExtension: record.createdByExtension === true, reusedExistingTab: record.reusedExistingTab === true } };
   }
-  if (['login-blocked', 'captcha-required', 'captcha-error', 'question-unmatched', 'answer-option-ambiguous', 'default-option-not-found'].includes(status) || ['requires-login', 'captcha-required', 'captcha-error', 'question-unmatched', 'answer-option-ambiguous', 'default-option-not-found'].includes(reason)) {
-    runtimeState.run.status = 'running';
+  if (['login-blocked', 'captcha-required', 'captcha-error', 'question-unmatched', 'answer-not-visible', 'answer-option-ambiguous', 'question-fuzzy-match-requires-confirmation', 'default-option-not-found'].includes(status) || ['requires-login', 'captcha-required', 'captcha-error', 'question-unmatched', 'answer-not-visible', 'answer-option-ambiguous', 'question-fuzzy-match-requires-confirmation', 'default-option-not-found'].includes(reason)) {
+    runtimeState.run.status = 'paused';
     runtimeState.run.lastError = reason || status;
     runtimeState.run.currentTabId = tabId;
     await saveRuntimeState();
     if (typeof chrome.tabs?.update === 'function') {
       chrome.tabs.update(tabId, { active: true }).catch(() => {});
       chrome.tabs.get(tabId).then((t) => {
-        if (t?.windowId && typeof chrome.windows?.update === 'function') {
+        if (Number.isInteger(t?.windowId) && typeof chrome.windows?.update === 'function') {
           chrome.windows.update(t.windowId, { focused: true }).catch(() => {});
         }
       }).catch(() => {});
@@ -1925,8 +2478,22 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
     }
     return { ok: true, accepted: true, retained: true };
   }
+  runtimeState.run.status = 'paused';
   runtimeState.run.lastError = reason || status;
+  runtimeState.run.currentTabId = tabId;
   await saveRuntimeState();
+  if (Number.isInteger(tabId) && typeof chrome.tabs?.update === 'function') {
+    chrome.tabs.update(tabId, { active: true }).catch(() => {});
+    chrome.tabs.get(tabId).then((t) => {
+      if (Number.isInteger(t?.windowId) && typeof chrome.windows?.update === 'function') {
+        chrome.windows.update(t.windowId, { focused: true }).catch(() => {});
+      }
+    }).catch(() => {});
+  }
+  if (typeof chrome.action?.setBadgeText === 'function') {
+    chrome.action.setBadgeText({ text: '!' }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' }).catch(() => {});
+  }
   if (autoRun) {
     await loadAutoState();
     const failure = { ...result, status, reason };
@@ -1959,6 +2526,21 @@ const coordinatorFinalize = async (finalize = null) => coordinatorQueue(async ()
     if (run.currentTabId !== finalize.tabId || run.stage !== 'checkin') return { ok: true, ignored: true };
     try {
       const pending = { ...runtimeState.actionsByTabId[String(finalize.tabId)], tabId: finalize.tabId, workflowId: finalize.workflowId, actionId: finalize.actionId, action: 'checkin', status: 'completed', lastResult: { action: 'checkin', status: 'success' } };
+      const finalizationMode = finalize.mode || inferRunMode(run, pending);
+      const shouldAdvanceToQuestion = finalizationMode === 'everything' || Boolean(finalize.workflowId);
+      if (shouldAdvanceToQuestion && !finalize.workflowId) {
+        // Legacy workflow records notify inside finalizeCompletedSuccess.
+        // Current everything-mode runs notify here before opening the question tab.
+        await showCoordinatorNotification('签到完成');
+      }
+      if (!shouldAdvanceToQuestion) {
+        const completed = await finalizeStandaloneCheckin(pending);
+        if (completed) return { ok: true, completed: true };
+        runtimeState.run.status = 'paused';
+        runtimeState.run.lastError = runtimeState.actionsByTabId[String(finalize.tabId)]?.finalizationError || 'standalone-checkin-finalization-failed';
+        await saveRuntimeState();
+        return { ok: true, retained: true };
+      }
       if (finalize.workflowId) {
         const finalized = await finalizeCompletedSuccess(pending);
         if (finalized) return { ok: true, completed: true };
@@ -1988,11 +2570,8 @@ const coordinatorFinalize = async (finalize = null) => coordinatorQueue(async ()
             // Re-check the single controlled tab invariant after the close
             // transition. Another CONTENT_READY/recovery event may already
             // have created the question page while this worker was yielding.
-            const existingQuestionTab = await findExistingTaskTab(questionUrl);
-            const questionTab = existingQuestionTab || (typeof chrome.tabs?.create === 'function'
-              ? await chrome.tabs.create({ url: questionUrl, active: false })
-              : null);
-            if (!questionTab) throw new Error('tabs-create-unavailable');
+            const existingQuestionTab = await findExistingTaskTab(questionUrl, { workflow: true });
+            const questionTab = existingQuestionTab || await createBackgroundTaskTab(questionUrl, originActiveTabId);
             const questionActionId = crypto.randomUUID();
             await createCoordinatorActionRecord({
               tabId: questionTab.id,
@@ -2104,7 +2683,10 @@ const coordinatorFinalize = async (finalize = null) => coordinatorQueue(async ()
     } catch (error) {
       await setRunError(error, 'checkin-finalize-failed');
     }
-    if (run.stage === 'checkin') {
+    // A standalone check-in must remain a check-in when its finalization
+    // fails. Only the explicit Everything/workflow mode is allowed to move
+    // the persisted run to the question stage after an error.
+    if (run.stage === 'checkin' && (finalize.workflowId || inferRunMode(run) === 'everything')) {
       await persistQuestionRunFailureState({ error: run.lastError ? new Error(run.lastError) : null, status: 'paused', transition: 'question' });
     }
     runtimeState.run.status = 'paused';
@@ -2118,7 +2700,7 @@ const coordinatorFinalize = async (finalize = null) => coordinatorQueue(async ()
     const current = await chrome.tabs.get(finalize.tabId).catch(() => null);
     const closeSkippedReason = runtimeState.actionsByTabId[String(finalize.tabId)]?.closeSkippedReason || runtimeState.awaitingContentByTabId[String(finalize.tabId)]?.closeSkippedReason || null;
     const retainReasons = new Set(['active-tab', 'origin-active-tab', 'origin-restore-failed']);
-    if (!closed && current?.id && retainReasons.has(closeSkippedReason)) {
+    if (!closed && Number.isInteger(current?.id) && retainReasons.has(closeSkippedReason)) {
       runtimeState.run.status = 'paused';
       await saveRuntimeState();
       return { ok: true, retained: true };
@@ -2133,7 +2715,7 @@ const coordinatorFinalize = async (finalize = null) => coordinatorQueue(async ()
       if (typeof chrome.action?.setBadgeText === 'function') {
         chrome.action.setBadgeText({ text: '' }).catch(() => {});
       }
-      await showCoordinatorNotification('签到和答题完成');
+      await showCoordinatorNotification((finalize.mode || inferRunMode(run, pending)) === 'question' ? '答题完成' : '签到和答题完成');
       return { ok: true, completed: true };
     }
     runtimeState.run.status = 'paused';
@@ -2165,6 +2747,7 @@ const recoverRemovedCompletedCheckin = async (tabId) => {
     actionId: record.actionId,
     runId: run.runId,
     stage: 'checkin',
+    mode: inferRunMode(run, record),
     workflowId: record.workflowId,
     createdByExtension: record.createdByExtension === true,
     reusedExistingTab: record.reusedExistingTab === true,
@@ -2206,13 +2789,26 @@ const reconcileCoordinator = async ({ now = new Date(), source = 'startup' } = {
       lastError: null,
       events: run.events,
     };
+    runtimeState.actionsByTabId = {};
+    runtimeState.awaitingContentByTabId = {};
+    runtimeState.pendingActionsById = {};
+    runtimeState.workflowsById = {};
+    runtimeState.activeWorkflowId = null;
     await saveRuntimeState();
+    if (typeof chrome.alarms?.getAll === 'function' && typeof chrome.alarms?.clear === 'function') {
+      const alarms = await chrome.alarms.getAll().catch(() => []);
+      for (const alarm of Array.isArray(alarms) ? alarms : []) {
+        if (typeof alarm?.name === 'string' && alarm.name.startsWith(RUNTIME_FINALIZE_ALARM_PREFIX)) {
+          await chrome.alarms.clear(alarm.name).catch(() => {});
+        }
+      }
+    }
   }
   await cleanupNonActiveDailyTabs(sameDay ? currentTabId : null);
   if (!sameDay) return { ok: true, run: runtimeState.run, source };
   const current = currentTabId != null ? await chrome.tabs.get(currentTabId).catch(() => null) : null;
   const record = currentTabId != null ? getActionRecord(currentTabId) || getAwaitingRecord(currentTabId) : null;
-  if (record?.status === 'completed' && record.finalizationPending && isSuccessResult(record.lastResult) && run.currentActionId === record.actionId && (current?.id || record.action === 'question' || record.action === 'checkin')) {
+  if (record?.status === 'completed' && record.finalizationPending && isSuccessResult(record.lastResult) && run.currentActionId === record.actionId && (Number.isInteger(current?.id) || record.action === 'question' || record.action === 'checkin')) {
     const finalized = await recoverCompletedActionFinalization(record, { now }).catch((error) => {
       setRunError(error, 'reconcile-finalize-failed');
       return false;
@@ -2224,12 +2820,12 @@ const reconcileCoordinator = async ({ now = new Date(), source = 'startup' } = {
     }
     return { ok: true, run: runtimeState.run, source };
   }
-  if (current?.id && record && run.currentActionId === record.actionId) {
+  if (Number.isInteger(current?.id) && record && run.currentActionId === record.actionId) {
     await retryDeliverIfNeeded(currentTabId, { force: true }).catch((error) => setRunError(error, 'reconcile-deliver-failed'));
     return { ok: true, run: runtimeState.run, source };
   }
   const page = actionPage(run.stage || 'checkin');
-  const reusable = await findExistingTaskTab(page);
+  const reusable = await findExistingTaskTab(page, { workflow: inferRunMode(run) === 'everything' });
   if (reusable?.id != null) {
     const actionId = run.currentActionId || crypto.randomUUID();
     runtimeState.run.stage = run.stage || 'checkin';
@@ -2250,7 +2846,7 @@ const reconcileCoordinator = async ({ now = new Date(), source = 'startup' } = {
   runtimeState.run.currentActionId = actionId;
   if (Number.isInteger(originActiveTabId) && !Number.isInteger(runtimeState.run.originActiveTabId)) runtimeState.run.originActiveTabId = originActiveTabId;
   await saveRuntimeState();
-  const tab = await chrome.tabs.create({ url: page, active: false });
+  const tab = await createBackgroundTaskTab(page, runtimeState.run.originActiveTabId ?? originActiveTabId);
   await createCoordinatorActionRecord({ tabId: tab.id, action: runtimeState.run.stage, actionId, createdByExtension: true, reusedExistingTab: false, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId });
   return { ok: true, tab, run: runtimeState.run, source };
 });
@@ -2269,9 +2865,10 @@ const startEverythingWorkflow = async ({ manual = false } = {}) => {
 const startAutoEverythingWorkflow = async ({ now = new Date(), random = Math.random } = {}) => {
   if (startAutoEverythingPromise) return startAutoEverythingPromise;
   startAutoEverythingPromise = (async () => {
-    await consumeAutoPlanForToday({ now });
+    const consumed = await consumeAutoPlanForToday({ now });
+    if (!consumed?.ok) return consumed;
     try {
-      return await startEverythingWorkflow();
+      return await coordinatorStart({ action: 'everything', source: 'auto', manual: false, now });
     } catch (error) {
       const currentCount = Number.isInteger(autoState?.retry?.count) ? autoState.retry.count : 0;
       if (currentCount < AUTO_RECOVERY_RETRY_LIMIT) {
@@ -2323,7 +2920,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
     case ExtensionProtocol.MESSAGE_TYPES.FOCUS_TASK_TAB: {
-      const tabId = message.payload?.tabId || runtimeState?.run?.currentTabId;
+      const requestedTabId = message.payload?.tabId;
+      const tabId = Number.isInteger(requestedTabId) ? requestedTabId : runtimeState?.run?.currentTabId;
       if (Number.isInteger(tabId)) {
         chrome.tabs?.get(tabId).then((tab) => {
           chrome.tabs?.update(tabId, { active: true }).catch(() => {});
@@ -2348,9 +2946,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     case ExtensionProtocol.MESSAGE_TYPES.AUTO_SCHEDULE_ENABLE: {
       (async () => {
-        await enableAutoSchedule();
+        await enableAutoSchedule({ plan: message.payload?.plan || null });
         await loadAutoState();
-        sendResponse({ ok: true, payload: await getAutoStatePayload() });
+        const payload = await getAutoStatePayload();
+        sendResponse({ ok: payload.enabled || payload.lastError !== 'auto-schedule-not-configured', payload });
       })().catch((e) => sendResponse({ ok: false, error: e.message }));
       return true;
     }
@@ -2403,7 +3002,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
     case ExtensionProtocol.MESSAGE_TYPES.LOOKUP_QUESTION:
-      Promise.all([loadBank(), chrome.storage.local.get(LearnedAnswers.STORAGE_KEY)]).then(([bank, stored]) => { const question = message.payload?.question; const options = message.payload?.options; const records = LearnedAnswers.normalizeRecords(stored[LearnedAnswers.STORAGE_KEY]); const entries = LearnedAnswers.toMatcherEntries(records, bank.entries, question, options); const result = QuestionMatcher.lookup(question, options, entries); sendResponse({ ok: true, payload: { ...result, ...(result.status === 'matched' ? { source: entries[0]?.source || 'public' } : {}) } }); }).catch((e) => sendResponse({ ok: false, error: e.message, payload: { status: 'unmatched', reason: 'lookup-error' } }));
+      Promise.all([loadBank(), chrome.storage.local.get(LearnedAnswers.STORAGE_KEY)]).then(([bank, stored]) => { const question = message.payload?.question; const options = message.payload?.options; const records = LearnedAnswers.normalizeRecords(stored[LearnedAnswers.STORAGE_KEY]); const entries = LearnedAnswers.toMatcherEntries(records, bank.entries, question, options); const result = QuestionMatcher.lookup(question, options, entries); const matchedEntry = result.entryId ? entries.find((entry) => entry.id === result.entryId) : null; sendResponse({ ok: true, payload: { ...result, ...(result.status === 'matched' ? { source: matchedEntry?.source || 'public' } : {}) } }); }).catch((e) => sendResponse({ ok: false, error: e.message, payload: { status: 'unmatched', reason: 'lookup-error' } }));
       return true;
     case ExtensionProtocol.MESSAGE_TYPES.QUESTION_STATE:
       sendResponse({ ok: true, type: message.type, payload: message.payload ?? {} });
@@ -2417,6 +3016,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     default:
       return false;
   }
+});
+
+chrome.tabs?.onActivated?.addListener((activeInfo) => {
+  const tabId = Number.isInteger(activeInfo?.tabId) ? activeInfo.tabId : null;
+  if (!Number.isInteger(tabId)) return undefined;
+  return holdUserTabDuringBackgroundRun(tabId).catch((error) => setRunError(error, 'activated-origin-restore-failed'));
 });
 
 chrome.tabs?.onUpdated?.addListener((tabId, changeInfo, tab) => {
@@ -2474,5 +3079,15 @@ chrome.alarms?.onAlarm?.addListener((alarm) => {
       if (!record || record.status !== 'completed' || !record.finalizationPending || !isSuccessResult(record.lastResult)) return;
       await recoverCompletedActionFinalization(record, { now: new Date() }).catch((error) => setRunError(error, 'runtime-finalize-failed'));
     }).catch((error) => setRunError(error, 'runtime-finalize-failed'));
+    return;
+  }
+  if (alarm?.name === AUTO_ALARM_NAME || (typeof alarm?.name === 'string' && alarm.name.startsWith(AUTO_RETRY_ALARM_PREFIX))) {
+    startAutoEverythingWorkflow({ now: new Date() }).catch(async (error) => {
+      await loadAutoState().catch(() => {});
+      if (autoState) {
+        autoState.lastError = error?.message || String(error);
+        await saveAutoState().catch(() => {});
+      }
+    });
   }
 });

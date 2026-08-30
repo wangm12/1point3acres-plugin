@@ -70,10 +70,11 @@ const makeHarness = ({ session = {}, local = {}, tabs = [], removeMode = 'normal
       create: async (name, info) => { alarms.set(name, { name, ...info }); },
       clear: async (name) => { alarms.delete(name); return true; },
       get: async (name) => alarms.get(name) || null,
+      getAll: async () => [...alarms.values()],
       onAlarm: { addListener: (fn) => { listeners.alarm = fn; } },
     },
-    action: { setIcon: async () => {} },
-    notifications: { create: async () => 'n1' },
+    action: { setIcon: async () => {}, setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {} },
+    notifications: { create: async (opts) => { events.push(['notifications.create', opts]); return 'n1'; } },
   };
   const context = { globalThis: {}, console, crypto: { randomUUID: (() => { let i = 0; return () => `uuid-${++i}`; })() }, fetch: async () => ({ ok: true, json: async () => ({ entries: [] }) }), chrome };
   vm.createContext(context);
@@ -154,7 +155,7 @@ const runtime = (h) => h.session[runtimeKey] || {};
   await h.send('RUN_ONE_CLICK', { action: 'checkin' });
   const tabId = runtime(h).run.currentTabId;
   await h.send('CONTENT_READY', {}, { tab: { id: 999 } });
-  assert.equal(h.events.filter((e) => e[0] === 'tabs.sendMessage').length, 0);
+  assert.equal(h.events.filter((e) => e[0] === 'tabs.sendMessage' && e[1] === 999).length, 0);
   assert.equal(runtime(h).run.currentTabId, tabId);
 }
 
@@ -281,7 +282,22 @@ const runtime = (h) => h.session[runtimeKey] || {};
   await h.send('ACTION_RESULT', { actionId: run.currentActionId, action: 'checkin', status: 'success' }, { tab: { id: run.currentTabId } });
   await h.send('ACTION_RESULT', { actionId: run.currentActionId, action: 'checkin', status: 'success' }, { tab: { id: run.currentTabId } });
   await flush();
+  assert.equal(h.events.filter((e) => e[0] === 'tabs.create' && e[2] === questionUrl).length, 0, 'standalone check-in must never chain into a question tab');
+  assert.equal(h.tabMap.has(42), true, 'a reused user tab must remain open after standalone check-in');
+}
+
+{
+  const h = makeHarness({ tabs: [{ id: 44, url: checkinUrl, active: false }] });
+  await h.send('RUN_ONE_CLICK', { action: 'checkin' });
+  const checkinRun = runtime(h).run;
+  await h.send('ACTION_RESULT', { actionId: checkinRun.currentActionId, action: 'checkin', status: 'success' }, { tab: { id: checkinRun.currentTabId } });
+  await flush();
+  assert.equal(runtime(h).run.stage, 'checkin');
+  assert.equal(runtime(h).run.status, 'paused');
+  await h.send('RUN_ONE_CLICK', { action: 'question' });
+  assert.equal(runtime(h).run.stage, 'question', 'a later standalone question request must not be swallowed by a paused check-in run');
   assert.equal(h.events.filter((e) => e[0] === 'tabs.create' && e[2] === questionUrl).length, 1);
+  assert.equal(h.tabMap.has(44), true, 'switching standalone stages must preserve the completed user tab');
 }
 
 {
@@ -304,15 +320,15 @@ const runtime = (h) => h.session[runtimeKey] || {};
   await h.send('ACTION_RESULT', { actionId: run.currentActionId, action: 'question', status: 'success' }, { tab: { id: run.currentTabId } });
   await flush();
   const after = h.events.filter((e) => e[0] === 'tabs.remove' || e[0] === 'tabs.update' || e[0] === 'tabs.create').length;
-  assert.equal(after, before + 1);
-  assert.equal(h.tabMap.has(91), false);
+  assert.equal(after, before, 'standalone question must not mutate a reused user tab');
+  assert.equal(h.tabMap.has(91), true);
 }
 
 {
   const h = makeHarness({ tabs: [{ id: 51, url: questionUrl, active: true }, { id: 52, url: checkinUrl, active: false }] });
   h.listeners.startup?.();
   await flush();
-  assert.equal(h.tabMap.has(52), false);
+  assert.equal(h.tabMap.has(52), true, 'startup must not close an unowned inactive task tab');
   assert.equal(h.tabMap.has(51), true);
 }
 
@@ -320,7 +336,7 @@ const runtime = (h) => h.session[runtimeKey] || {};
   const h = makeHarness({ tabs: [{ id: 61, url: questionUrl, active: true }, { id: 62, url: checkinUrl, active: false }] });
   h.listeners.startup?.();
   await flush();
-  assert.equal(h.tabMap.has(51), false);
+  assert.equal(h.tabMap.has(62), true, 'cleanup must not remove a task tab without an explicit success record');
   assert.equal(h.tabMap.has(61), true);
 }
 
@@ -339,7 +355,7 @@ const runtime = (h) => h.session[runtimeKey] || {};
   h.listeners.startup?.();
   await flush();
   assert.equal(h.session[runtimeKey].run.currentTabId, null);
-  assert.equal(h.tabMap.has(99), false);
+  assert.equal(h.tabMap.has(99), true, 'cross-day reconciliation must leave an unowned tab untouched');
 }
 
 {
@@ -351,6 +367,160 @@ const runtime = (h) => h.session[runtimeKey] || {};
   await flush();
   assert.equal(h.session[runtimeKey].run.runId, null);
   assert.equal(h.session[runtimeKey].run.currentActionId, null);
+  assert.equal(h.tabMap.has(99), true, 'cross-day question cleanup must leave the task tab untouched');
+}
+
+{
+  const h = makeHarness({
+    session: { [runtimeKey]: { version: 2, run: { runId: 'old-alarm-run', laDateKey: staleDateKey, source: 'manual', stage: 'question', status: 'running', transition: null, lease: null, attempt: 1, currentTabId: 101, originActiveTabId: null, currentActionId: 'old-action', lastError: null, events: [] }, actionsByTabId: {}, awaitingContentByTabId: {}, pendingActionsById: {}, workflowsById: {}, activeWorkflowId: null } },
+    tabs: [{ id: 101, url: questionUrl, active: false }],
+  });
+  h.alarms.set('p3a-runtime-finalize:old-action', { name: 'p3a-runtime-finalize:old-action', when: Date.now() });
+  h.listeners.startup?.();
+  await flush();
+  assert.equal(h.alarms.has('p3a-runtime-finalize:old-action'), false, 'cross-day runtime finalization alarm must be cleared');
+}
+
+{
+  const h = makeHarness({
+    local: {
+      [autoKey]: {
+        enabled: true,
+        plan: { dateKey: staleDateKey, nextRunAt: Date.now() - 1000, scheduledAt: Date.now() - 2000, alarmName: 'p3a-auto-schedule' },
+      },
+    },
+  });
+  h.alarms.set('p3a-auto-schedule', { name: 'p3a-auto-schedule', when: Date.now() });
+  h.alarms.set(`p3a-auto-retry:${staleDateKey}`, { name: `p3a-auto-retry:${staleDateKey}`, when: Date.now() });
+  await h.send('AUTO_SCHEDULE_GET');
+  assert.equal(h.alarms.has('p3a-auto-schedule'), false, 'stale auto plan alarm must be cleared');
+  assert.equal(h.alarms.has(`p3a-auto-retry:${staleDateKey}`), false, 'stale auto retry alarm must be cleared');
+}
+
+{
+  const h = makeHarness({
+    local: {
+      [autoKey]: {
+        enabled: true,
+        plan: { dateKey: todayDateKey, nextRunAt: Date.now() - 1000, scheduledAt: Date.now() - 2000, alarmName: 'p3a-auto-schedule' },
+        lastRunDateKey: todayDateKey,
+        lastRunStatus: 'completed',
+      },
+    },
+  });
+  await h.send('AUTO_SCHEDULE_GET');
+  assert.equal(h.alarms.size, 0, 'completed auto plan must not be re-scheduled by a state read');
+}
+
+{
+  const h = makeHarness({
+    local: {
+      [autoKey]: {
+        enabled: true,
+        activeRunDateKey: todayDateKey,
+        lastRunStatus: 'started',
+        plan: { dateKey: todayDateKey, nextRunAt: Date.now() - 1000, scheduledAt: Date.now() - 2000, alarmName: 'p3a-auto-schedule' },
+      },
+    },
+    tabs: [{ id: 71, url: checkinUrl, active: false }],
+  });
+  h.listeners.startup?.();
+  await flush();
+  assert.equal(h.tabMap.has(71), true, 'auto startup recovery must preserve an unrelated inactive task tab');
+  assert.equal(h.events.filter((e) => e[0] === 'tabs.create' && e[2] === checkinUrl).length, 1, 'auto startup recovery must create its own managed task tab');
+  assert.notEqual(runtime(h).run.currentTabId, 71, 'auto startup recovery must not adopt the unrelated inactive tab');
+}
+
+{
+  const slashUrl = `${checkinUrl}/`;
+  const h = makeHarness({ tabs: [{ id: 201, url: slashUrl, active: true }] });
+  await h.send('RUN_ONE_CLICK', { action: 'everything' });
+  assert.equal(runtime(h).run.currentTabId, 201, 'trailing-slash check-in URL must be reused instead of opening a duplicate tab');
+  assert.equal(h.events.filter((e) => e[0] === 'tabs.create' && String(e[2]).includes('daily-checkin')).length, 0);
+}
+
+{
+  const h = makeHarness({ tabs: [{ id: 202, url: 'https://1point3acres.com/next/daily-checkin', active: true }] });
+  await h.send('RUN_ONE_CLICK', { action: 'everything' });
+  assert.equal(runtime(h).run.currentTabId, 202, 'apex host check-in URL must be reused');
+}
+
+{
+  const h = makeHarness();
+  await h.send('RUN_ONE_CLICK', { action: 'everything' });
+  const tabId = runtime(h).run.currentTabId;
+  const tab = h.tabMap.get(tabId);
+  tab.url = `${checkinUrl}/`;
+  await h.send('ACTION_RESULT', { actionId: runtime(h).run.currentActionId, action: 'checkin', status: 'success' }, { tab: { id: tabId } });
+  await flush();
+  assert.equal(h.tabMap.has(tabId), false, 'everything check-in success must close a tab after it redirects to a trailing-slash URL');
+}
+
+{
+  const h = makeHarness({ tabs: [{ id: 211, url: checkinUrl, active: false }] });
+  await h.send('RUN_ONE_CLICK', { action: 'checkin' });
+  const tabId = runtime(h).run.currentTabId;
+  await h.send('ACTION_RESULT', { actionId: runtime(h).run.currentActionId, action: 'checkin', status: 'failed', reason: 'timeout' }, { tab: { id: tabId } });
+  await flush();
+  assert.equal(runtime(h).run.status, 'paused', 'timeout must pause the run so the popup can retry');
+  assert.equal(runtime(h).run.lastError, 'timeout');
+}
+
+{
+  const h = makeHarness({ tabs: [{ id: 221, url: checkinUrl, active: false }] });
+  await h.send('RUN_ONE_CLICK', { action: 'checkin' });
+  await h.send('ACTION_RESULT', {
+    actionId: runtime(h).run.currentActionId,
+    action: 'checkin',
+    status: 'failed',
+    reason: 'captcha-required',
+  }, { tab: { id: runtime(h).run.currentTabId } });
+  await flush();
+  assert.equal(runtime(h).run.mode, 'checkin');
+  assert.equal(runtime(h).run.status, 'paused');
+  await h.send('RUN_ONE_CLICK', { action: 'everything' });
+  await flush();
+  assert.equal(runtime(h).run.mode, 'everything', '一键 must upgrade a live standalone check-in run');
+  await h.send('ACTION_RESULT', {
+    actionId: runtime(h).run.currentActionId,
+    action: 'checkin',
+    status: 'success',
+  }, { tab: { id: runtime(h).run.currentTabId } });
+  await flush();
+  assert.equal(h.events.filter((e) => e[0] === 'tabs.create' && e[2] === questionUrl).length, 1, 'upgraded everything run must chain into the question tab');
+}
+
+{
+  const h = makeHarness();
+  await h.send('RUN_ONE_CLICK', { action: 'question' });
+  const tabId = runtime(h).run.currentTabId;
+  await h.send('ACTION_RESULT', { actionId: runtime(h).run.currentActionId, action: 'question', status: 'success' }, { tab: { id: tabId } });
+  await flush();
+  const notes = h.events.filter((e) => e[0] === 'notifications.create').map((e) => e[1]?.message);
+  assert.equal(notes.includes('答题完成'), true, 'standalone question success must notify 答题完成');
+  assert.equal(notes.includes('签到和答题完成'), false, 'standalone question success must not claim check-in finished');
+}
+
+{
+  const h = makeHarness({
+    local: {
+      [autoKey]: {
+        enabled: true,
+        plan: { dateKey: todayDateKey, nextRunAt: Date.now() - 1000, scheduledAt: Date.now() - 2000, alarmName: 'p3a-auto-schedule' },
+      },
+    },
+    tabs: [{ id: 231, url: checkinUrl, active: false }],
+  });
+  h.listeners.alarm?.({ name: 'p3a-auto-schedule' });
+  await flush();
+  await flush();
+  assert.equal(h.local[autoKey].lastRunStatus, 'started');
+  const createsAfterFirst = h.events.filter((e) => e[0] === 'tabs.create').length;
+  h.listeners.alarm?.({ name: 'p3a-auto-schedule' });
+  await flush();
+  await flush();
+  assert.equal(h.local[autoKey].lastRunStatus, 'started', 'an in-flight auto run must not be consumed again');
+  assert.equal(h.events.filter((e) => e[0] === 'tabs.create').length, createsAfterFirst, 'a second auto alarm must not open another task tab');
 }
 
 console.log('test-coordinator-lifecycle: ok');

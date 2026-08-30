@@ -117,7 +117,7 @@ const makeElement = (tagName, text = '') => {
   return element;
 };
 
-const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, lookupTimeouts = 0 } = {}) => {
+const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, lookupTimeouts = 0, lookupStatus = 'matched', lookupReason = null, lookupMatchType = 'exact', hydrateOptionsAfterReads = 0, lookupDependsOnVisibleAnswer = false } = {}) => {
   const answerText = '这些都有';
   const main = makeElement('main');
   const questionNode = makeElement('div', questionText);
@@ -193,7 +193,7 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
     },
   };
 
-  const lookupResponse = { ok: true, payload: { status: 'matched', optionIndex: 2, answerText } };
+  const lookupResponse = { ok: true, payload: { status: lookupStatus, ...(lookupReason ? { reason: lookupReason } : {}), matchType: lookupMatchType, optionIndex: 2, answerText } };
   const chrome = {
     runtime: {
       lastError: null,
@@ -212,6 +212,12 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
           lookupCallCount += 1;
           if (renderLookupRequestedAt === null) renderLookupRequestedAt = Date.now();
           if (lookupCallCount <= lookupTimeouts) return undefined;
+          if (lookupDependsOnVisibleAnswer) {
+            const visible = questionPage.findOptions().map(questionPage.clean);
+            if (!visible.includes(answerText)) {
+              return respond({ ok: true, payload: { status: 'unmatched', reason: 'answer-not-visible' } });
+            }
+          }
           renderLookupResolvedAt = Date.now();
           return respond(lookupResponse);
         }
@@ -238,7 +244,12 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
         value: questionReads <= changedAfterReads ? questionText : '另一道题',
       };
     },
-    findOptions: () => optionNodes,
+    findOptions: () => {
+      if (hydrateOptionsAfterReads > 0 && questionReads <= hydrateOptionsAfterReads) {
+        return optionNodes.slice(0, 2);
+      }
+      return optionNodes;
+    },
     findSelectedOption: () => selectedNode,
     findSubmit: () => submitButton,
     getState: () => questionState,
@@ -353,6 +364,28 @@ assert.equal(primary.submitClicks, 1, 'remote question flow must click the nativ
 assert(primary.submitClickedAt !== null, 'submit click timestamp should be recorded');
 assert(primary.lookupCallCount >= 1, 'remote question flow should consult the answer bank before submit');
 
+{
+  let responded = false;
+  const keepChannel = primary.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'everything' } },
+    {},
+    () => { responded = true; },
+  );
+  assert.equal(keepChannel, false, 'popup everything must not be answered by the content script');
+  assert.equal(responded, false, 'popup everything must not call sendResponse in the content script');
+}
+
+{
+  let responded = false;
+  const keepChannel = primary.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question' } },
+    {},
+    () => { responded = true; },
+  );
+  assert.equal(keepChannel, false, 'popup question without actionId must not be answered by the content script');
+  assert.equal(responded, false);
+}
+
 const duplicate = await new Promise((resolve) => {
   primary.runtimeListenerFn(
     { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'remote-1' } },
@@ -365,6 +398,34 @@ assert.equal(duplicate.accepted, true, 'duplicate remote action should be accept
 assert.equal(duplicate.duplicate, true, 'duplicate remote action should be deduped');
 assert.equal(primary.submitClicks, 1, 'duplicate action must not submit again');
 
+const fuzzy = buildQuestionHarness({ questionText: '一亩三分地里有哪些方面的干货信息？', lookupMatchType: 'fuzzy' });
+await waitFor(() => fuzzy.runtimeListenerFn, { message: 'fuzzy harness should register a runtime listener' });
+const fuzzyResponse = new Promise((resolve) => {
+  fuzzy.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'remote-fuzzy' } },
+    {},
+    (response) => resolve(response),
+  );
+});
+await fuzzyResponse.then((response) => assertResponse(response, 'fuzzy remote command must be accepted before validation'));
+await waitFor(() => fuzzy.actionResults.length >= 1, { message: 'fuzzy match must report a confirmation-required failure' });
+assert.equal(fuzzy.submitClicks, 0, 'fuzzy match must never submit automatically');
+assert.equal(fuzzy.actionResults[0]?.reason, 'question-fuzzy-match-requires-confirmation', 'fuzzy match must use the confirmation-required reason');
+
+const invisibleAnswer = buildQuestionHarness({ questionText: '一亩三分地里有哪些方面的干货信息？', lookupStatus: 'unmatched', lookupReason: 'answer-not-visible' });
+await waitFor(() => invisibleAnswer.runtimeListenerFn, { message: 'answer-not-visible harness should register a runtime listener' });
+const invisibleResponse = new Promise((resolve) => {
+  invisibleAnswer.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'remote-answer-not-visible' } },
+    {},
+    (response) => resolve(response),
+  );
+});
+await invisibleResponse.then((response) => assertResponse(response, 'answer-not-visible remote command must be accepted before validation'));
+await waitFor(() => invisibleAnswer.actionResults.length >= 1, { message: 'answer-not-visible match must report a safety failure' });
+assert.equal(invisibleAnswer.submitClicks, 0, 'answer-not-visible must never submit automatically');
+assert.equal(invisibleAnswer.actionResults[0]?.reason, 'answer-not-visible', 'answer-not-visible reason must be preserved');
+
 const guard = buildQuestionHarness({ questionText: '一亩三分地里有哪些方面的干货信息？', changedAfterReads: 1 });
 await waitFor(() => guard.runtimeListenerFn, { message: 'guard harness should register a runtime listener' });
 const guardResponse = new Promise((resolve) => {
@@ -375,13 +436,41 @@ const guardResponse = new Promise((resolve) => {
   );
 });
 await guardResponse.then((response) => assertResponse(response, 'guarded remote command must be accepted'));
-await waitFor(() => guard.actionResults.length >= 1, { message: 'changed question must report a failed ACTION_RESULT' });
-assert.equal(guard.submitClicks, 0, 'changed question must not submit');
-assert.equal(guard.actionResults[0]?.actionId, 'remote-2', 'changed question should keep the original action id');
-assert.equal(guard.actionResults[0]?.action, 'question', 'changed question should report the question action');
-assert.equal(guard.actionResults[0]?.status, 'failed', 'changed question should report failure');
-assert.equal(guard.actionResults[0]?.reason, 'question-changed-or-unavailable', 'changed question should stop auto submit and leave the tab for the user');
-assert.equal(primary.submitClicks, 1, 'first remote submit must remain the only submit click');
+await waitFor(() => guard.submitClicks === 1, { message: 'a later stable snapshot must be allowed to submit after the first paint changes' });
+assert.equal(guard.submitClicks, 1, 'question hydration/change inside the wait window must re-stabilize and submit');
+
+const hydrate = buildQuestionHarness({
+  questionText: '一亩三分地里有哪些方面的干货信息？',
+  hydrateOptionsAfterReads: 1,
+});
+await waitFor(() => hydrate.runtimeListenerFn, { message: 'hydrate harness should register a runtime listener' });
+const hydrateResponse = new Promise((resolve) => {
+  hydrate.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'remote-hydrate' } },
+    {},
+    (response) => resolve(response),
+  );
+});
+await hydrateResponse.then((response) => assertResponse(response, 'hydrating options must be accepted'));
+await waitFor(() => hydrate.submitClicks === 1, { message: '2-then-4 option hydration must re-stabilize and submit' });
+assert.equal(hydrate.submitClicks, 1, 'option hydration inside the 5s window must not abort auto-submit');
+
+const lateAnswer = buildQuestionHarness({
+  questionText: '在一亩三分地发帖，需要遵守哪些规则？',
+  hydrateOptionsAfterReads: 4,
+  lookupDependsOnVisibleAnswer: true,
+});
+await waitFor(() => lateAnswer.runtimeListenerFn, { message: 'late-answer harness should register a runtime listener' });
+const lateAnswerResponse = new Promise((resolve) => {
+  lateAnswer.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'remote-late-answer' } },
+    {},
+    (response) => resolve(response),
+  );
+});
+await lateAnswerResponse.then((response) => assertResponse(response, 'late-appearing bank answer must be accepted'));
+await waitFor(() => lateAnswer.submitClicks === 1, { message: 'a first-stable snapshot missing the bank answer must keep waiting and submit after the option appears' });
+assert.equal(lateAnswer.submitClicks, 1, 'answer-not-visible during the readiness window must not abort auto-submit');
 
 const notReady = buildQuestionHarness({ questionText: '', changedAfterReads: Infinity });
 await waitFor(() => notReady.runtimeListenerFn, { message: 'not-ready harness should register a runtime listener' });

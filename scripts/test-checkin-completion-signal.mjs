@@ -121,6 +121,9 @@ const makeElement = (tagName, text = '') => {
           if (selector.includes('[placeholder*="验证码"]') && /验证码/.test(String(child.getAttribute?.('placeholder') || ''))) found.push(child);
           if (selector.includes('[placeholder*="captcha" i]') && /captcha/i.test(String(child.getAttribute?.('placeholder') || ''))) found.push(child);
           if (selector.includes('[aria-label*="captcha" i]') && /captcha/i.test(String(child.getAttribute?.('aria-label') || ''))) found.push(child);
+          if (selector.includes('[role="status"]') && child.getAttribute('role') === 'status') found.push(child);
+          if (selector.includes('[role="alert"]') && child.getAttribute('role') === 'alert') found.push(child);
+          if (selector.includes('[class*="toast"]') && /toast/i.test(String(child.className || ''))) found.push(child);
           if (selector.includes('main') && child.tagName === 'MAIN') found.push(child);
           walk(child);
         }
@@ -306,7 +309,7 @@ const buildCheckinHarness = () => {
   };
 };
 
-const buildQuestionHarness = ({ completionText, noiseText = '' }) => {
+const buildQuestionHarness = ({ completionText, noiseText = '', completionToastOutside = false }) => {
   let runtimeListener = null;
   let actionResultCalls = 0;
   const actionResults = [];
@@ -339,6 +342,13 @@ const buildQuestionHarness = ({ completionText, noiseText = '' }) => {
   submitButton.click = () => {
     submitClicks += 1;
     queueMicrotask(() => {
+      if (completionToastOutside) {
+        const toast = makeElement('div', completionText || '答题成功，获得大米');
+        toast.setAttribute('role', 'status');
+        toast.className = 'site-toast';
+        body.appendChild(toast);
+        return;
+      }
       if (completionText != null) {
         main.innerText = completionText;
         main.textContent = completionText;
@@ -383,8 +393,8 @@ const buildQuestionHarness = ({ completionText, noiseText = '' }) => {
           return Promise.resolve({ ok: true, accepted: true, actionId: message.payload?.actionId });
         }
         if (message.type === 'LOOKUP_QUESTION') {
-          asyncCallback(callback, { ok: true, payload: { status: 'matched', optionIndex: 2, answerText } });
-          return Promise.resolve({ ok: true, payload: { status: 'matched', optionIndex: 2, answerText } });
+          asyncCallback(callback, { ok: true, payload: { status: 'matched', matchType: 'exact', optionIndex: 2, answerText } });
+          return Promise.resolve({ ok: true, payload: { status: 'matched', matchType: 'exact', optionIndex: 2, answerText } });
         }
         asyncCallback(callback, { ok: true });
         return Promise.resolve({ ok: true });
@@ -558,6 +568,19 @@ assertRemoteAccepted(questionNoiseResponse, 'noise regression command must be ac
 await delay(350);
 assert.equal(questionNoiseHarness.submitClicks, 1, 'noise text must not trigger an extra submit');
 assert.equal(questionNoiseHarness.actionResults.some((result) => result.status === 'success' && result.reason === 'completed'), false, 'unrelated body success text must not be treated as completion');
+
+const questionToastHarness = buildQuestionHarness({ completionToastOutside: true, completionText: '答题成功，获得大米' });
+assert.equal(typeof questionToastHarness.runtimeListener, 'function', 'content script must register a runtime listener for portaled question toast');
+const questionToastResponse = await new Promise((resolve) => {
+  questionToastHarness.runtimeListener(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'question-toast-1' } },
+    {},
+    resolve,
+  );
+});
+assertRemoteAccepted(questionToastResponse, 'portaled question toast command must be accepted');
+await waitFor(() => questionToastHarness.actionResults.some((result) => result.status === 'success' && result.reason === 'completed'), { timeoutMs: 1200, message: '答题成功 toast outside main must complete the remote question wait' });
+assert.equal(questionToastHarness.submitClicks, 1, 'portaled success toast must not trigger a second submit');
 
 const buildCaptchaHarness = ({ actionId, captchaText = '请输入验证码后继续签到', decorate }) => {
   const body = makeElement('body');
@@ -788,6 +811,43 @@ await runCaptchaScenario('success-text-with-captcha-widget', {
   assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-required'), false, 'autoresolved turnstile must never trigger captcha-required');
 }
 
+// Persistent Cloudflare Turnstile "Verifying..." must not expire into
+// captcha-required and yank a background tab. The live site leaves the
+// widget mounted after submit; success text appears later.
+{
+  let targetIframe = null;
+  let targetMain = null;
+  const harness = buildCaptchaHarness({
+    actionId: 'checkin-cloudflare-persistent-turnstile',
+    captchaText: '正在验证...',
+    decorate: ({ captchaMain }) => {
+      targetMain = captchaMain;
+      targetIframe = makeElement('iframe');
+      targetIframe.setAttribute('src', 'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv0/0/m0fkl/0x4AAAAAAADnPIDROrmt1Wwj/light/normal');
+      targetIframe.setAttribute('title', 'Verifying...');
+      captchaMain.appendChild(targetIframe);
+    },
+  });
+  const response = await new Promise((resolve) => {
+    harness.runtimeListener(
+      { type: 'RUN_ONE_CLICK', payload: { action: 'checkin', actionId: harness.actionId } },
+      {},
+      resolve,
+    );
+  });
+  assertRemoteAccepted(response, 'persistent turnstile command must be accepted');
+  await delay(80);
+  assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-required'), false, 'a verifying Turnstile that outlives the captcha grace period must not report captcha-required');
+  setTimeout(() => {
+    if (targetMain) {
+      targetMain.innerText = '签到成功';
+      targetMain.textContent = '签到成功';
+    }
+  }, 90);
+  await waitFor(() => harness.actionResults.some((result) => result.status === 'success' && result.reason === 'completed'), { timeoutMs: 1200, message: 'persistent verifying Turnstile should still complete when success text appears later' });
+  assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-required'), false, 'late success after persistent Turnstile must not have reported captcha-required');
+}
+
 const buildFlushHarness = ({ href, storedResults, windowName = 'p3a-test-tab' }) => {
   let runtimeListener = null;
   const actionResults = [];
@@ -870,6 +930,7 @@ const buildFlushHarness = ({ href, storedResults, windowName = 'p3a-test-tab' })
 };
 
 const sharedTabName = 'p3a-tab-p3a-test-tab';
+const storedAt = Date.now();
 const questionRecord = {
   actionId: 'flushQuestion',
   action: 'question',
@@ -878,6 +939,7 @@ const questionRecord = {
   pageKind: 'daily-question',
   taskUrl: 'https://www.1point3acres.com/next/daily-question',
   tabIdentity: sharedTabName,
+  updatedAt: storedAt,
   url: 'https://www.1point3acres.com/next/daily-question',
 };
 const checkinRecord = {
@@ -888,6 +950,7 @@ const checkinRecord = {
   pageKind: 'daily-checkin',
   taskUrl: 'https://www.1point3acres.com/next/daily-checkin',
   tabIdentity: sharedTabName,
+  updatedAt: storedAt,
   url: 'https://www.1point3acres.com/next/daily-checkin',
 };
 
@@ -896,18 +959,20 @@ const wrongPageQuestionHarness = buildFlushHarness({
   windowName: sharedTabName,
   storedResults: { flushQuestion: questionRecord },
 });
+await delay(20);
 assert.equal(typeof wrongPageQuestionHarness.runtimeListener, 'function', 'content script must register on check-in page');
 assert.deepEqual(toPlain(wrongPageQuestionHarness.actionResults), [], 'question result must not flush on check-in page');
-assert.deepEqual(toPlain(wrongPageQuestionHarness.store['p3a-pending-remote-results-v1']), { flushQuestion: questionRecord }, 'question result must be preserved for the matching page');
+assert.deepEqual(toPlain(wrongPageQuestionHarness.store['p3a-pending-remote-results-v1']), toPlain({ flushQuestion: { ...questionRecord, url: undefined } }), 'question result must be preserved without the live URL');
 
 const wrongPageCheckinHarness = buildFlushHarness({
   href: 'https://www.1point3acres.com/next/daily-question',
   windowName: sharedTabName,
   storedResults: { flushCheckin: checkinRecord },
 });
+await delay(20);
 assert.equal(typeof wrongPageCheckinHarness.runtimeListener, 'function', 'content script must register on question page');
 assert.deepEqual(toPlain(wrongPageCheckinHarness.actionResults), [], 'check-in result must not flush on question page');
-assert.deepEqual(toPlain(wrongPageCheckinHarness.store['p3a-pending-remote-results-v1']), { flushCheckin: checkinRecord }, 'check-in result must be preserved for the matching page');
+assert.deepEqual(toPlain(wrongPageCheckinHarness.store['p3a-pending-remote-results-v1']), toPlain({ flushCheckin: { ...checkinRecord, url: undefined } }), 'check-in result must be preserved without the live URL');
 
 const samePageHarness = buildFlushHarness({
   href: 'https://www.1point3acres.com/next/daily-checkin',

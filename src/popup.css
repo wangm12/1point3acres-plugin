@@ -3,6 +3,14 @@
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: Canvas;
   color: CanvasText;
+  --p3a-accent: #9a3412;
+  --p3a-accent-hover: #7c2d12;
+  --p3a-on-accent: #fff7ed;
+  --p3a-warning: #92400e;
+  --p3a-on-warning: #fff7ed;
+  --p3a-info: #1d4ed8;
+  --p3a-success: #047857;
+  --p3a-danger: #b91c1c;
 }
 
 html, body {
@@ -60,8 +68,8 @@ h1 {
   gap: 10px;
   padding: 10px 12px;
   border-radius: 12px;
-  background: color-mix(in srgb, #f59e0b 16%, Canvas);
-  border: 1px solid color-mix(in srgb, #f59e0b 40%, transparent);
+  background: color-mix(in srgb, var(--p3a-warning) 16%, Canvas);
+  border: 1px solid color-mix(in srgb, var(--p3a-warning) 40%, transparent);
   animation: slide-in 0.2s ease-out;
 }
 
@@ -83,7 +91,7 @@ h1 {
   margin: 0;
   font-size: 12px;
   font-weight: 700;
-  color: color-mix(in srgb, #d97706 90%, CanvasText);
+  color: var(--p3a-warning);
 }
 
 .alert-desc {
@@ -99,11 +107,12 @@ h1 {
   flex-shrink: 0;
   appearance: none;
   border: none;
-  background: #d97706;
-  color: #fff;
+  background: var(--p3a-warning);
+  color: var(--p3a-on-warning);
   font-size: 11px;
   font-weight: 700;
   padding: 6px 10px;
+  min-height: 44px;
   border-radius: 8px;
   cursor: pointer;
   box-shadow: 0 2px 6px rgba(217, 119, 6, 0.3);
@@ -130,19 +139,21 @@ h1 {
   width: 100%;
   border: none;
   border-radius: 12px;
-  background: linear-gradient(135deg, #f97316 0%, #ea580c 100%);
-  color: #ffffff;
+  background: var(--p3a-accent);
+  color: var(--p3a-on-accent);
   padding: 12px 16px;
   font-size: 15px;
   font-weight: 700;
   cursor: pointer;
-  box-shadow: 0 4px 12px rgba(234, 88, 12, 0.35);
+  min-height: 44px;
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--p3a-accent) 35%, transparent);
   transition: transform 0.1s, box-shadow 0.1s, opacity 0.1s;
 }
 
 .btn-primary:hover:not(:disabled) {
   transform: translateY(-1px);
-  box-shadow: 0 6px 16px rgba(234, 88, 12, 0.45);
+  background: var(--p3a-accent-hover);
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--p3a-accent-hover) 45%, transparent);
 }
 
 .btn-primary:active:not(:disabled) {
@@ -176,10 +187,18 @@ h1 {
   background: color-mix(in srgb, Canvas 90%, CanvasText 10%);
   color: inherit;
   padding: 8px 10px;
+  min-height: 44px;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
   transition: background 0.1s;
+}
+
+.btn-primary:focus-visible,
+.btn-secondary:focus-visible,
+.btn-alert:focus-visible {
+  outline: 3px solid Highlight;
+  outline-offset: 2px;
 }
 
 .btn-secondary:hover:not(:disabled) {
@@ -257,18 +276,45 @@ h1 {
 }
 
 .badge-running {
-  background: color-mix(in srgb, #3b82f6 20%, Canvas);
-  color: #3b82f6;
+  background: color-mix(in srgb, var(--p3a-info) 20%, Canvas);
+  color: var(--p3a-info);
 }
 
 .badge-done {
-  background: color-mix(in srgb, #10b981 20%, Canvas);
-  color: #059669;
+  background: color-mix(in srgb, var(--p3a-success) 20%, Canvas);
+  color: var(--p3a-success);
 }
 
 .badge-error {
-  background: color-mix(in srgb, #ef4444 20%, Canvas);
-  color: #dc2626;
+  background: color-mix(in srgb, var(--p3a-danger) 20%, Canvas);
+  color: var(--p3a-danger);
+}
+
+@keyframes slide-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --p3a-accent: #fdba74;
+    --p3a-accent-hover: #fed7aa;
+    --p3a-on-accent: #431407;
+    --p3a-warning: #fbbf24;
+    --p3a-on-warning: #451a03;
+    --p3a-info: #93c5fd;
+    --p3a-success: #6ee7b7;
+    --p3a-danger: #fca5a5;
+  }
 }
 
 /* 底部状态 */
@@ -283,4 +329,3 @@ h1 {
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
-

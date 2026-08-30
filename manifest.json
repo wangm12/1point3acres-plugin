@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "一亩三分地每日助手",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "在一亩三分地每日答题和签到页面提供本地学习与人工确认辅助。",
+  "minimum_chrome_version": "111",
   "icons": {
     "16": "assets/1point3acres-helper-icon-16.png",
     "32": "assets/1point3acres-helper-icon-32.png",
@@ -24,7 +25,8 @@
   },
   "permissions": [
     "storage",
-    "notifications"
+    "notifications",
+    "alarms"
   ],
   "host_permissions": [
     "https://1point3acres.com/*",
@@ -40,11 +42,11 @@
       ],
       "js": [
         "src/shared/protocol.js",
-      "src/shared/question-matcher.js",
+        "src/shared/question-matcher.js",
         "src/shared/learned-answers.js",
         "src/shared/daily-question-page.js",
-      "src/shared/daily-checkin-page.js",
-      "src/shared/checkin-state.js",
+        "src/shared/daily-checkin-page.js",
+        "src/shared/checkin-state.js",
         "src/content.js"
       ],
       "css": [

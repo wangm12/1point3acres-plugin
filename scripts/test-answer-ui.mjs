@@ -4,11 +4,15 @@ import fs from 'node:fs';
 const source = fs.readFileSync(new URL('../src/content.js', import.meta.url), 'utf8');
 const css = fs.readFileSync(new URL('../src/content.css', import.meta.url), 'utf8');
 
-assert.match(source, /if \(autoSelectedKey !== questionKey && selected !== target && typeof target\.click === 'function'\)/, 'auto click must be guarded by questionKey and manual selection');
+assert.match(source, /if \(result\.matchType === 'exact' && autoSelectedKey !== questionKey && selected !== target && typeof target\.click === 'function'\)/, 'toolbar auto-click must require an exact match');
+assert.match(source, /if \(result\.matchType === 'exact' && autoSubmitKey !== questionKey/, 'exact toolbar hits must auto-submit once after the site confirms selection');
 assert.match(source, /autoSelectedKey = questionKey;/, 'guard must be recorded before auto click');
 assert.match(source, /prepared = \{ questionKey, optionIndex: result\.optionIndex, node: target, answer: lookupAnswerText, optionTexts: lookupOptionTexts \};/, 'prepared must rebind to the live selected node');
 assert.match(source, /if \(selected === target && \(prepared\?\.questionKey === questionKey \|\| autoSelectedKey === questionKey\)\)/, 'node replacement must rebind only for the same question');
-assert.match(source, /const waitForStableQuestionSnapshot = async/, 'remote direct submission must wait for a stable snapshot');
+assert.match(source, /if \(!actionId\) return false/, 'content must ignore popup RUN_ONE_CLICK messages without actionId');
+assert.match(source, /signature !== lastSignature/, 'question snapshots must re-baseline when the signature changes');
+assert.doesNotMatch(source, /else if \(signature !== initialReadySignature\) \{\s*return \{ ok: false, reason: 'question-changed-or-unavailable' \}/, 'the first complete snapshot must not abort the 5s stability window');
+assert.match(source, /if \(activeRemoteActionId \|\| pendingRemoteActions\.size\)/, 'toolbar must no-op while a remote action is in flight');
 assert.match(source, /const QUESTION_READY_TIMEOUT_MS = 5000;/, 'remote question action must give a newly opened page a bounded five-second render window');
 assert.match(source, /const lookupResponse = await bridge\.send\(ExtensionProtocol\.MESSAGE_TYPES\.LOOKUP_QUESTION/, 'remote direct submission must re-query lookup at execution time');
 assert.match(source, /const target = matching\[0\];/, 'remote direct submission must use fresh current options');

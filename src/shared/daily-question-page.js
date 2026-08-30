@@ -165,8 +165,12 @@
   function getState(root = global.document) {
     const scope = taskScope(root);
     const body = scope ? String(scope.innerText || scope.textContent || '') : String(root.body?.innerText || root.body?.textContent || '');
+    const toastText = Array.from(root.querySelectorAll?.('[role="status"], [role="alert"], [class*="toast"]') || [])
+      .filter((node) => !withinToolbar(node))
+      .map((node) => clean(node))
+      .join('\n');
     if (STATUS.login.test(body)) return 'requires-login';
-    if (hasCompletedControl(root, scope) || STATUS.completed.test(body)) return 'completed';
+    if (hasCompletedControl(root, scope) || STATUS.completed.test(body) || STATUS.completed.test(toastText)) return 'completed';
     return 'active';
   }
 

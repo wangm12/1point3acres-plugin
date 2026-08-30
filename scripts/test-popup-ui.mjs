@@ -152,6 +152,22 @@ const makeMockDom = () => {
   assert.equal(elements.get('overall-status-badge').textContent, '已全部完成');
   assert.equal(elements.get('checkin-task-status').textContent, '已完成');
   assert.equal(elements.get('question-task-status').textContent, '已完成');
+
+  popup.render({
+    run: {
+      status: 'paused',
+      stage: 'question',
+      lastError: 'timeout',
+      currentTabId: 7,
+    },
+    actionsByTabId: {
+      '7': { action: 'question', status: 'failed', lastResult: { reason: 'timeout' }, tabId: 7 },
+    },
+  });
+  assert.equal(elements.get('alert-banner').hidden, false, 'timeout should show the blocked banner');
+  assert.equal(elements.get('run-everything').disabled, false, 'paused timeout must not disable retry buttons');
+  assert.equal(elements.get('run-checkin').disabled, false);
+  assert.equal(elements.get('run-question').disabled, false);
 }
 
 // 2. 测试一键操作触发

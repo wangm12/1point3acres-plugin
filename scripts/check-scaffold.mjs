@@ -56,7 +56,7 @@ for (const size of iconPaths) {
 assert(!JSON.stringify(manifest).includes('helper-icon-enabled'), 'manifest must not reference runtime-only enabled icons');
 assert(manifest.background?.service_worker === 'src/service-worker.js', 'background service worker path mismatch');
 assert(manifest.action?.default_popup === 'src/popup.html', 'popup path mismatch');
-assert(JSON.stringify(manifest.permissions ?? []) === JSON.stringify(['storage', 'notifications']), 'permissions must be exactly storage and notifications');
+assert(JSON.stringify(manifest.permissions ?? []) === JSON.stringify(['storage', 'notifications', 'alarms']), 'permissions must be exactly storage, notifications, and alarms');
 assert(JSON.stringify(manifest.host_permissions ?? []) === JSON.stringify(['https://1point3acres.com/*', 'https://www.1point3acres.com/*']), 'host permissions must be limited to 1point3acres');
 
 const contentScripts = manifest.content_scripts ?? [];

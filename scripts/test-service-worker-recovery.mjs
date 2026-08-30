@@ -294,7 +294,7 @@ const runStore = (session = {}, local = { 'p3a-learned-answers-v1': [] }) => ({ 
   await harness.listeners.startup?.();
   await flush();
   assert.equal(harness.tabMap.has(102), false);
-  assert.equal(harness.tabMap.has(202), false);
+  assert.equal(harness.tabMap.has(202), true, 'recovery must not close an unrelated background question tab');
   assert.equal(harness.events.filter((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question')).length, 1, 'recovery must replace stale question pages with one managed question tab');
   assert.equal(store.session[runtimeKey].run.stage, 'question');
 }
@@ -338,7 +338,7 @@ const runStore = (session = {}, local = { 'p3a-learned-answers-v1': [] }) => ({ 
 
 {
   const store = runStore();
-  const harness = makeHarness({ store, tabs: [{ id: 51, url: 'https://www.1point3acres.com/next/daily-checkin', active: false }] });
+  const harness = makeHarness({ store, tabs: [] });
   const open = await harness.send('RUN_ONE_CLICK', { action: 'checkin' });
   await flush();
   const tabId = open.payload.tabId;
@@ -346,13 +346,10 @@ const runStore = (session = {}, local = { 'p3a-learned-answers-v1': [] }) => ({ 
   const resp = await harness.send('ACTION_RESULT', { actionId, action: 'checkin', status: 'success' }, { tab: { id: tabId } });
   await flush();
   assert.equal(resp.ok, true);
-  assert.equal(store.session[runtimeKey].run.stage, 'question');
-  const qTabId = harness.events.find((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question'))[1].id;
-  const qActionId = store.session[runtimeKey].actionsByTabId[String(qTabId)].actionId;
-  const dup = await harness.send('ACTION_RESULT', { actionId: qActionId, action: 'question', status: 'success' }, { tab: { id: qTabId } });
-  await flush();
-  assert.equal(dup.ok, true);
-  assert.equal(dup.accepted, true);
+  assert.equal(store.session[runtimeKey].run.status, 'idle', 'standalone check-in should finish without creating a question stage');
+  assert.equal(store.session[runtimeKey].run.stage, null);
+  assert.equal(harness.events.some((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question')), false, 'standalone check-in must not create a question tab');
+  assert.equal(harness.tabMap.has(tabId), false, 'an extension-created standalone check-in tab can be closed after success');
 }
 
 {
@@ -374,7 +371,7 @@ const runStore = (session = {}, local = { 'p3a-learned-answers-v1': [] }) => ({ 
   const harness = makeHarness({ store, tabs: [{ id: 71, url: 'https://www.1point3acres.com/next/daily-question', active: false }, { id: 171, url: 'https://www.1point3acres.com/next/daily-question', active: true }] });
   await harness.listeners.startup?.();
   await flush();
-  assert.equal(harness.tabMap.has(71), false);
+  assert.equal(harness.tabMap.has(71), true, 'a legacy workflow without a current run must not close tabs during startup');
   assert.equal(harness.tabMap.has(171), true);
   assert.equal(store.session[runtimeKey].actionsByTabId['71'].finalizationPending, true);
   assert.equal(harness.events.filter((e) => e[0] === 'tabs.create' && e[1].url.includes('/daily-question')).length, 0);

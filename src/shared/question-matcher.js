@@ -93,11 +93,16 @@
           return { index, sim: bestSim };
         }).sort((a, b) => b.sim - a.sim);
 
-        if (scored[0].sim > scored[1].sim) {
+        if (scored[0].sim - scored[1].sim >= 0.05) {
           return { status: 'matched', matchType: 'exact', optionIndex: scored[0].index, answerText: visible[scored[0].index], entryId: exactEntry.id };
         }
         return { status: 'ambiguous', matchType: 'exact', candidates: exactEntry.answers || [], entryId: exactEntry.id };
       }
+
+      // An exact question with no visible exact answer is a safety stop.  Do
+      // not let a nearby question supply an answer: the wording may differ by
+      // a single negation or an important qualifier.
+      return { status: 'unmatched', reason: 'answer-not-visible', entryId: exactEntry.id };
     }
 
     // Tier 2: Similar question & candidate answers aggregation
@@ -189,4 +194,3 @@
 
   global.QuestionMatcher = Object.freeze({ normalize, strictNormalize, getNGrams, calculateSimilarity, lookup });
 })(globalThis);
-

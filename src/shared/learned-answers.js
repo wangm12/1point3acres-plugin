@@ -38,7 +38,11 @@
     });
     if (question !== undefined && Array.isArray(options)) {
       const matcher = global.QuestionMatcher?.lookup;
-      const local = matcher && locals.find((entry) => matcher(question, options, [entry]).status === 'matched');
+      const local = matcher && locals.find((entry) => {
+        if (entry.conflicts?.length) return false;
+        const result = matcher(question, options, [entry]);
+        return result.status === 'matched' && result.matchType === 'exact';
+      });
       return local ? [local] : publicList;
     }
     return locals.concat(publicList);

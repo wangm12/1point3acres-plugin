@@ -14,9 +14,9 @@ const runtimeKey = 'p3a-runtime-v1';
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const makeHarness = ({ store, tabs = [], tabsGetMode = {}, tabsRemoveMode = {}, queryMode = null, alarmCreateMode = 'ok', alarmGetMode = {}, createThrowsForQuestion = false }) => {
+const makeHarness = ({ store, tabs = [], tabsGetMode = {}, tabsRemoveMode = {}, queryMode = null, alarmCreateMode = 'ok', alarmGetMode = {}, createThrowsForQuestion = false, stealFocusOnCreate = false }) => {
   const events = [];
-  const listeners = { message: null, updated: null, alarm: null };
+  const listeners = { message: null, updated: null, activated: null, alarm: null };
   let nextTabId = Math.max(0, ...tabs.map((tab) => tab.id || 0)) + 1;
   const tabMap = new Map(tabs.map((tab) => [tab.id, { ...tab }]));
   const alarmMap = new Map();
@@ -66,7 +66,11 @@ const makeHarness = ({ store, tabs = [], tabsGetMode = {}, tabsRemoveMode = {}, 
       },
       create: async ({ url, active }) => {
         if (createThrowsForQuestion && String(url || '').includes('/daily-question')) throw new Error('create-failed');
-        const tab = { id: nextTabId++, url, active: active === true };
+        const becameActive = stealFocusOnCreate || active === true;
+        if (becameActive) {
+          for (const otherTab of tabMap.values()) otherTab.active = false;
+        }
+        const tab = { id: nextTabId++, url, active: becameActive };
         tabMap.set(tab.id, tab);
         events.push(['tabs.create', { ...tab }]);
         return { ...tab };
@@ -81,6 +85,7 @@ const makeHarness = ({ store, tabs = [], tabsGetMode = {}, tabsRemoveMode = {}, 
           }
         }
         events.push(['tabs.update', tabId, { ...changes }]);
+        if (changes.active === true) listeners.activated?.({ tabId });
         return { ...tab };
       },
       remove: async (tabId) => {
@@ -107,6 +112,7 @@ const makeHarness = ({ store, tabs = [], tabsGetMode = {}, tabsRemoveMode = {}, 
         return { ok: true, accepted: true, actionId: message.payload.actionId };
       },
       onUpdated: { addListener: (fn) => { listeners.updated = fn; } },
+      onActivated: { addListener: (fn) => { listeners.activated = fn; } },
     },
     notifications: {
       create: async (opts) => { events.push(['notifications.create', opts]); return 'n1'; },
@@ -131,7 +137,14 @@ const makeHarness = ({ store, tabs = [], tabsGetMode = {}, tabsRemoveMode = {}, 
   vm.runInContext(workerSource, context);
 
   const send = (type, payload, sender = {}) => new Promise((resolve) => listeners.message({ type, payload }, sender, resolve));
-  return { events, send, store, tabMap };
+  const activateTab = async (tabId) => {
+    const tab = tabMap.get(tabId);
+    if (!tab) throw new Error('missing-tab');
+    for (const otherTab of tabMap.values()) otherTab.active = otherTab.id === tabId;
+    events.push(['tabs.activated', tabId]);
+    await listeners.activated?.({ tabId });
+  };
+  return { events, send, store, tabMap, activateTab };
 };
 
 {
@@ -334,7 +347,9 @@ assert.ok(harness.events.find((event) => event[0] === 'notifications.create' && 
   const checkinResult = await harness.send('ACTION_RESULT', { actionId: checkinAction.actionId, action: 'checkin', status: 'success', reason: 'already-completed' }, { tab: { id: checkinTabId } });
   await flush();
   assert.equal(checkinResult.ok, true, 'already-completed checkin should be accepted from a real workflow record');
-  assert.equal(harness.events.some((event) => event[0] === 'tabs.update' && event[1] === 61), false, 'completed checkin should not switch the user back to the origin tab');
+  const originRestoreIndex = harness.events.findIndex((event) => event[0] === 'tabs.update' && event[1] === 61 && event[2]?.active === true);
+  const checkinCloseIndex = harness.events.findIndex((event) => event[0] === 'tabs.remove' && event[1] === checkinTabId);
+  assert.ok(originRestoreIndex >= 0 && checkinCloseIndex > originRestoreIndex, 'closing a visible task tab must restore the origin tab first');
   assert.equal(harness.events.some((event) => event[0] === 'tabs.remove' && event[1] === checkinTabId), true, 'completed checkin task tab should be closed');
   assert.equal(harness.events.some((event) => event[0] === 'tabs.update' && event[1] === checkinTabId && String(event[2].url).includes('/daily-question')), false, 'closed checkin tab should not be promoted in place');
   const questionCreate = harness.events.find((event) => event[0] === 'tabs.create' && String(event[1].url).includes('/daily-question'));
@@ -345,7 +360,7 @@ assert.ok(harness.events.find((event) => event[0] === 'notifications.create' && 
   const questionResult = await harness.send('ACTION_RESULT', { actionId: questionAction.actionId, action: 'question', status: 'success', reason: 'already-completed' }, { tab: { id: questionTabId } });
   await flush();
   assert.equal(questionResult.ok, true, 'already-completed question should be accepted from a real workflow record');
-  assert.equal(harness.events.some((event) => event[0] === 'tabs.update' && event[1] === 61), false, 'active question should not switch back to the origin tab');
+  assert.equal(harness.tabMap.get(61)?.active, true, 'user origin tab must stay active while the background question tab finishes');
   assert.equal(harness.events.some((event) => event[0] === 'tabs.remove' && event[1] === questionTabId), true, 'completed question tab should be closed');
   assert.equal(store.session[runtimeKey].workflowsById[response.payload.workflowId], undefined, 'real workflow should be cleared after question success');
   assert.equal(store.session[runtimeKey].activeWorkflowId, null, 'real workflow should clear activeWorkflowId after question success');
@@ -376,7 +391,9 @@ assert.ok(harness.events.find((event) => event[0] === 'notifications.create' && 
   const result = await harness.send('ACTION_RESULT', { actionId: questionAction.actionId, action: 'question', status: 'success', reason: 'already-completed' }, { tab: { id: questionTabId } });
   await flush();
   assert.equal(result.ok, true, 'independent question already-completed should be accepted');
-  assert.equal(harness.events.some((event) => event[0] === 'tabs.update' && event[1] === 71), false, 'independent question should not reactivate the user tab');
+  const originRestoreIndex = harness.events.findIndex((event) => event[0] === 'tabs.update' && event[1] === 71 && event[2]?.active === true);
+  const questionCloseIndex = harness.events.findIndex((event) => event[0] === 'tabs.remove' && event[1] === questionTabId);
+  assert.ok(originRestoreIndex >= 0 && questionCloseIndex > originRestoreIndex, 'closing a visible standalone question tab must restore the origin tab first');
   assert.equal(harness.events.some((event) => event[0] === 'tabs.remove' && event[1] === questionTabId), true, 'independent one-click question tab should close after completion');
 }
 
@@ -437,7 +454,9 @@ assert.ok(harness.events.find((event) => event[0] === 'notifications.create' && 
   assert.equal(checkinResp.ok, true, 'active checkin completion should still be accepted');
   assert.equal(harness.events.filter((event) => event[0] === 'tabs.remove' && event[1] === 151).length, 1, 'active task tab should be closed after completion');
   assert.equal(harness.events.some((event) => event[0] === 'tabs.update' && event[1] === 151 && String(event[2].url).includes('/daily-question')), false, 'closed active checkin tab should not be promoted in-place');
-  assert.equal(harness.events.some((event) => event[0] === 'tabs.update' && event[1] === 202), false, 'ordinary origin tab must not be touched during task finalization');
+  const originRestoreIndex = harness.events.findIndex((event) => event[0] === 'tabs.update' && event[1] === 202 && event[2]?.active === true);
+  const checkinCloseIndex = harness.events.findIndex((event) => event[0] === 'tabs.remove' && event[1] === 151);
+  assert.ok(originRestoreIndex >= 0 && checkinCloseIndex > originRestoreIndex, 'closing the visible checkin tab must restore the ordinary origin tab first');
   assert.equal(harness.tabMap.has(151), false, 'completed active checkin tab should be removed');
   const questionCreate = harness.events.find((event) => event[0] === 'tabs.create' && String(event[1].url).includes('/daily-question'));
   assert.ok(questionCreate, 'closing an active checkin tab should still start the question stage');
@@ -995,6 +1014,76 @@ assert.ok(harness.events.find((event) => event[0] === 'notifications.create' && 
   );
   assert.ok(store.session[runtimeKey].workflowsById['workflow-61'], 'active tab should preserve workflow evidence for recovery');
   assert.equal(harness.events.filter((event) => event[0] === 'tabs.remove' && event[1] === 61).length, 0, 'active tab must not be removed');
+}
+
+{
+  const store = { session: {}, local: { 'p3a-learned-answers-v1': [] } };
+  const harness = makeHarness({
+    store,
+    stealFocusOnCreate: true,
+    tabs: [{ id: 91, url: 'https://github.com/example/repo', active: true }],
+    queryMode: (queryInfo, tabMap) => {
+      if (queryInfo?.currentWindow === true) return [];
+      const activeTabs = [...tabMap.values()].filter((tab) => tab.active === true);
+      if (queryInfo?.lastFocusedWindow === true || queryInfo?.active === true) return activeTabs;
+      return [...tabMap.values()];
+    },
+  });
+
+  const response = await harness.send('RUN_ONE_CLICK', { action: 'everything' });
+  await flush();
+  assert.equal(response.ok, true, 'focus-steal workflow should start');
+  const checkinCreated = harness.events.find((event) => event[0] === 'tabs.create' && String(event[1].url).includes('/daily-checkin'));
+  assert.ok(checkinCreated, 'focus-steal workflow must create a checkin tab');
+  assert.equal(harness.tabMap.get(91)?.active, true, 'user origin tab must be restored after a background task tab steals focus');
+  assert.equal(harness.tabMap.get(checkinCreated[1].id)?.active, false, 'stolen task tab must not stay in the foreground');
+  assert.equal(
+    harness.events.some((event) => event[0] === 'tabs.update' && event[1] === 91 && event[2]?.active === true),
+    true,
+    'worker must explicitly return focus to the origin tab',
+  );
+}
+
+{
+  const store = { session: {}, local: { 'p3a-learned-answers-v1': [] } };
+  const harness = makeHarness({
+    store,
+    tabs: [{ id: 301, url: 'chrome://extensions', active: true }],
+    queryMode: (queryInfo, tabMap) => {
+      if (queryInfo?.currentWindow === true) return [];
+      const activeTabs = [...tabMap.values()].filter((tab) => tab.active === true);
+      if (queryInfo?.lastFocusedWindow === true || queryInfo?.active === true) return activeTabs;
+      return [...tabMap.values()];
+    },
+  });
+
+  const response = await harness.send('RUN_ONE_CLICK', { action: 'everything' });
+  await flush();
+  assert.equal(response.ok, true, 'extensions-page workflow should start in the background');
+  const checkinCreated = harness.events.find((event) => event[0] === 'tabs.create' && String(event[1].url).includes('/daily-checkin'));
+  assert.ok(checkinCreated, 'extensions-page workflow must create a checkin tab');
+  const checkinTabId = checkinCreated[1].id;
+  assert.equal(harness.tabMap.get(301)?.active, true, 'chrome://extensions must stay active after background tab create');
+  assert.equal(harness.tabMap.get(checkinTabId)?.active, false, 'created checkin tab must start in the background');
+
+  await harness.activateTab(checkinTabId);
+  await flush();
+  assert.equal(harness.tabMap.get(301)?.active, true, 'a later Chrome focus steal onto the task tab must bounce back to chrome://extensions');
+  assert.equal(harness.tabMap.get(checkinTabId)?.active, false, 'task tab must not remain visible after a late focus steal');
+
+  const checkinAction = store.session[runtimeKey].actionsByTabId[String(checkinTabId)];
+  const checkinResult = await harness.send('ACTION_RESULT', { actionId: checkinAction.actionId, action: 'checkin', status: 'success', reason: 'already-completed' }, { tab: { id: checkinTabId } });
+  await flush();
+  assert.equal(checkinResult.ok, true, 'already-completed checkin should be accepted after a late steal');
+  const questionCreate = harness.events.find((event) => event[0] === 'tabs.create' && String(event[1].url).includes('/daily-question'));
+  assert.ok(questionCreate, 'workflow should still open the question tab after checkin');
+  const questionTabId = questionCreate[1].id;
+  assert.equal(harness.tabMap.get(301)?.active, true, 'opening the question tab must not leave chrome://extensions');
+
+  await harness.activateTab(questionTabId);
+  await flush();
+  assert.equal(harness.tabMap.get(301)?.active, true, 'question-page load stealing focus must bounce back to chrome://extensions');
+  assert.equal(harness.tabMap.get(questionTabId)?.active, false, 'question tab must not stay in the foreground after page-load steal');
 }
 
 console.log('completed workflow regression test passed.');
