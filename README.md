@@ -1,6 +1,6 @@
 # 一亩三分地每日助手
 
-当前版本 **v0.2.0**。这是一个 Manifest V3 Chrome 扩展，为一亩三分地的 `/next/daily-question` 和 `/next/daily-checkin` 页面提供本地学习、人工确认和一键自动流程辅助。它不替用户绕过站点流程。
+当前版本 **v0.2.2**。这是一个 Manifest V3 Chrome 扩展，为一亩三分地的 `/next/daily-question` 和 `/next/daily-checkin` 页面提供本地学习、人工确认和一键自动流程辅助。它不替用户绕过站点流程。
 
 ## 安装
 

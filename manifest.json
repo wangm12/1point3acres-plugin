@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "一亩三分地每日助手",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "帮助你完成一亩三分地的每日签到和每日答题。",
   "minimum_chrome_version": "111",
   "icons": {

@@ -39,7 +39,7 @@ jobs:
           glob: true
           extension-id: bbeffdhjkbcfhgfkhfendgfkcfhkbjlp
           publisher-id: 8b53592f-0935-4a6b-9ff2-04d61db9b50d
-          client-id: ${{ secrets.CWS_CLIENT_ID }}
-          client-secret: ${{ secrets.CWS_CLIENT_SECRET }}
-          refresh-token: ${{ secrets.CWS_REFRESH_TOKEN }}
+          client-id: ${{ secrets.CWS_CLIENT_ID || secrets.CLIENT_ID }}
+          client-secret: ${{ secrets.CWS_CLIENT_SECRET || secrets.CLIENT_SECRET }}
+          refresh-token: ${{ secrets.CWS_REFRESH_TOKEN || secrets.REFRESH_TOKEN }}
           publish: true
