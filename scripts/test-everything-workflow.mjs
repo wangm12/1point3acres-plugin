@@ -12,6 +12,8 @@ assert.match(html, /id="run-question"/);
 assert.match(html, /id="alert-action-btn"/);
 assert.doesNotMatch(html, /打开每日答题|打开每日签到/);
 assert.match(popup, /sendRuntimeMessage\(ExtensionProtocol\.MESSAGE_TYPES\.RUN_ONE_CLICK/);
+assert.match(worker, /importScripts\('shared\/action-indicator.js'\)/);
+assert.match(worker, /const syncActionIndicator = async/);
 assert.match(worker, /const RUNTIME_STORAGE_KEY = 'p3a-runtime-v1'/);
 assert.match(worker, /const runtimeStorage = chrome\.storage\.session \|\| chrome\.storage\.local/);
 assert.match(worker, /const coordinatorStart = async/);

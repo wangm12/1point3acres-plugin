@@ -14,7 +14,9 @@ const source = fs
   .replace('const QUESTION_SUBMIT_POLL_MS = 100;', 'const QUESTION_SUBMIT_POLL_MS = 1;')
   .replace('const QUESTION_LOOKUP_RESPONSE_TIMEOUT_MS = 1500;', 'const QUESTION_LOOKUP_RESPONSE_TIMEOUT_MS = 10;')
   .replace('const QUESTION_LOOKUP_RETRY_DELAY_MS = 250;', 'const QUESTION_LOOKUP_RETRY_DELAY_MS = 1;')
-  .replace('}, 180);', '}, 1);');
+  .replace('}, 180);', '}, 1);')
+  .replace('}, 3000);', '}, 1);')
+  .replace('}, 200);', '}, 1);');
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const waitFor = async (check, { timeoutMs = 500, intervalMs = 1, message = 'condition not met' } = {}) => {
@@ -117,7 +119,7 @@ const makeElement = (tagName, text = '') => {
   return element;
 };
 
-const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, lookupTimeouts = 0, lookupStatus = 'matched', lookupReason = null, lookupMatchType = 'exact', hydrateOptionsAfterReads = 0, lookupDependsOnVisibleAnswer = false } = {}) => {
+const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, lookupTimeouts = 0, lookupStatus = 'matched', lookupReason = null, lookupMatchType = 'exact', hydrateOptionsAfterReads = 0, lookupDependsOnVisibleAnswer = false, holdSubmitResult = false, lookupDelayMs = 0, lookupStatusAfterFirst = null, interactiveChallenge = false } = {}) => {
   const answerText = '这些都有';
   const main = makeElement('main');
   const questionNode = makeElement('div', questionText);
@@ -155,11 +157,14 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
 
   const submitButton = makeElement('button', '提交答案');
   submitButton.setAttribute('type', 'submit');
+  const completeQuestion = () => {
+    questionState = 'completed';
+    body.innerText = '答题成功，获得大米';
+  };
   submitButton.click = () => {
     submitClicks += 1;
     submitClickedAt = Date.now();
-    questionState = 'completed';
-    body.innerText = '答题成功，获得大米';
+    if (!holdSubmitResult) completeQuestion();
   };
 
   main.append(questionNode, ...optionNodes, submitButton);
@@ -171,7 +176,15 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
   const body = makeElement('body');
   body.append(main);
 
+  if (interactiveChallenge) {
+    const iframe = makeElement('iframe');
+    iframe.setAttribute('src', 'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv0/0/m0fkl/0x4AAAAAAADnPIDROrmt1Wwj/light/normal');
+    iframe.setAttribute('title', 'Verify you are human');
+    body.appendChild(iframe);
+  }
+
   const document = {
+    title: interactiveChallenge ? 'Just a moment...' : '',
     body,
     createElement: (tag) => makeElement(tag),
     getElementById: (id) => {
@@ -218,13 +231,28 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
               return respond({ ok: true, payload: { status: 'unmatched', reason: 'answer-not-visible' } });
             }
           }
-          renderLookupResolvedAt = Date.now();
-          return respond(lookupResponse);
+          const effectiveStatus = lookupStatusAfterFirst && lookupCallCount > 1
+            ? lookupStatusAfterFirst
+            : lookupStatus;
+          const payload = effectiveStatus === lookupStatus
+            ? lookupResponse.payload
+            : { status: effectiveStatus, ...(lookupReason ? { reason: lookupReason } : {}), matchType: lookupMatchType, optionIndex: 2, answerText };
+          const deliver = () => {
+            renderLookupResolvedAt = Date.now();
+            return respond({ ok: true, payload });
+          };
+          if (lookupDelayMs > 0 && lookupCallCount > 1) {
+            setTimeout(() => {
+              if (typeof callback === 'function') callback({ ok: true, payload });
+            }, lookupDelayMs);
+            return undefined;
+          }
+          return deliver();
         }
 
         if (message.type === 'CONTENT_READY' || message.type === 'SAVE_LEARNED_ANSWER' || message.type === 'ACTION_RESULT') {
           if (message.type === 'ACTION_RESULT') actionResults.push(message.payload);
-          return respond({ ok: true });
+          return respond({ ok: true, accepted: true });
         }
 
         return respond({ ok: true });
@@ -337,6 +365,7 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
     get actionResults() {
       return actionResults;
     },
+    completeQuestion,
   };
 };
 
@@ -505,5 +534,87 @@ const noCallbackHarness = buildQuestionHarness({ questionText: '一亩三分地�
 const noCallbackResult = noCallbackHarness.chrome.runtime.sendMessage({ type: 'CONTENT_READY' });
 assert.equal(typeof noCallbackResult?.then, 'function', 'sendMessage without callback should return a promise-like value');
 await noCallbackResult;
+
+const localThenRemote = buildQuestionHarness({
+  questionText: '一亩三分地里有哪些方面的干货信息？',
+  holdSubmitResult: true,
+});
+await waitFor(() => localThenRemote.submitClicks === 1, { timeoutMs: 500, message: 'toolbar auto-submit must click the site submit once' });
+const localThenRemoteResponse = await new Promise((resolve) => {
+  localThenRemote.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'remote-join-local' } },
+    {},
+    resolve,
+  );
+});
+assertResponse(localThenRemoteResponse, 'remote action arriving during local auto-submit must be accepted');
+await delay(20);
+assert.equal(localThenRemote.submitClicks, 1, 'remote action must not submit again while local auto-submit is in flight');
+localThenRemote.completeQuestion();
+await waitFor(() => localThenRemote.actionResults.some((result) => result.actionId === 'remote-join-local' && result.status === 'success'), {
+  timeoutMs: 500,
+  message: 'remote action must inherit the in-flight local submit result',
+});
+assert.equal(localThenRemote.submitClicks, 1, 'joining a local auto-submit must keep a single site submit');
+
+const localFailThenRemote = buildQuestionHarness({
+  questionText: '一亩三分地里有哪些方面的干货信息？',
+  lookupDelayMs: 20,
+  lookupStatusAfterFirst: 'unmatched',
+});
+await waitFor(() => localFailThenRemote.lookupCallCount >= 2, {
+  timeoutMs: 500,
+  message: 'local auto-submit must start a second lookup so a remote can join before it fails',
+});
+const localFailJoinedAt = Date.now();
+const localFailThenRemoteResponse = await new Promise((resolve) => {
+  localFailThenRemote.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'remote-join-local-fail' } },
+    {},
+    resolve,
+  );
+});
+assertResponse(localFailThenRemoteResponse, 'remote action arriving during a failing local auto-submit must be accepted');
+await waitFor(() => localFailThenRemote.actionResults.some((result) => result.actionId === 'remote-join-local-fail'), {
+  timeoutMs: 500,
+  message: 'joined remote must receive ACTION_RESULT when local auto-submit fails',
+});
+const localFailElapsedMs = Date.now() - localFailJoinedAt;
+const localFailResult = localFailThenRemote.actionResults.find((result) => result.actionId === 'remote-join-local-fail');
+assert.equal(localFailThenRemote.submitClicks, 0, 'failed local auto-submit must not submit, and the joined remote must not submit again');
+assert.equal(localFailResult?.action, 'question', 'joined remote must keep the question action');
+assert.equal(localFailResult?.status, 'failed', 'joined remote must fail with the local auto-submit');
+assert.equal(localFailResult?.reason, 'question-unmatched', 'joined remote must reuse the local unmatched reason');
+assert.ok(localFailElapsedMs < 50, `joined remote must finish well under REMOTE_RESULT_TIMEOUT_MS, took ${localFailElapsedMs}ms`);
+assert.equal(
+  localFailThenRemote.actionResults.filter((result) => result.actionId === 'remote-join-local-fail').length,
+  1,
+  'joined remote must receive exactly one ACTION_RESULT',
+);
+await delay(250);
+assert.equal(
+  localFailThenRemote.actionResults.filter((result) => result.actionId === 'remote-join-local-fail').length,
+  1,
+  'waitForRemoteResult must not emit a second timeout after local fail already finished the remote',
+);
+
+{
+  const challenged = buildQuestionHarness({ questionText: '一亩三分地里有哪些方面的干货信息？', interactiveChallenge: true, lookupStatus: 'unmatched' });
+  await waitFor(() => challenged.runtimeListenerFn, { message: 'interactive question harness should register a runtime listener' });
+  const response = await new Promise((resolve) => {
+    challenged.runtimeListenerFn(
+      { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'question-cf-interactive' } },
+      {},
+      resolve,
+    );
+  });
+  assertResponse(response, 'interactive question challenge command must be accepted');
+  await waitFor(() => challenged.actionResults.some((result) => result.reason === 'captcha-required'), {
+    timeoutMs: 800,
+    message: 'question interactive challenge should report captcha-required before submit',
+  });
+  assert.equal(challenged.submitClicks, 0, 'question interactive challenge must not click the site submit');
+  assert.equal(challenged.actionResults.some((result) => result.resumeMode === 'replay'), true, 'pre-submit question captcha must resume with replay');
+}
 
 console.log('question remote submit runtime tests passed.');

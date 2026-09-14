@@ -90,6 +90,8 @@ const isToolbarButton = (button) => button.closest(`#${toolbarId}`);
 const legacySubmitText = /提交答案|提交|确认答案/;
 const isQuestionPage = () => DailyQuestionPage.isQuestionPage(location.href);
 const pendingRemoteActions = new Set();
+let localQuestionSubmitInFlight = false;
+let localCheckinSubmitInFlight = false;
 const remoteActionTimers = new Map();
 const remoteActionResults = new Map();
 const remoteActionToastMessages = new Map();
@@ -247,15 +249,30 @@ const getPendingRemoteResult = async (actionId) => {
   const record = store?.[actionId];
   return record && typeof record === 'object' ? { ...record } : null;
 };
-const detectPageState = () => {
+const getSitePageState = () => {
   if (isQuestionPage()) return DailyQuestionPage.getState();
   if (isCheckinPage()) return DailyCheckinPage.getState();
   return 'unknown';
 };
+let lastCloudflareClass = null;
+const detectPageState = () => {
+  const siteState = getSitePageState();
+  if (siteState === 'completed' || siteState === 'requires-login') return siteState;
+  const action = isQuestionPage() ? 'question' : isCheckinPage() ? 'checkin' : null;
+  const classified = classifyCloudflareState(document.body, action);
+  if (classified === 'interactive' || classified === 'interstitial-pending') return 'captcha-required';
+  return siteState;
+};
 const getContentReadySignature = () => `${detectPageKind()}:${detectPageState()}`;
 const reportContentReady = (force = false) => {
+  const action = isQuestionPage() ? 'question' : isCheckinPage() ? 'checkin' : null;
+  const classified = classifyCloudflareState(document.body, action);
+  const leftChallenge = (lastCloudflareClass === 'interactive' || lastCloudflareClass === 'interstitial-pending')
+    && classified !== 'interactive'
+    && classified !== 'interstitial-pending';
+  lastCloudflareClass = classified;
   const pageSignature = getContentReadySignature();
-  if (!force && pageSignature === lastReportedPageSignature) return;
+  if (!force && !leftChallenge && pageSignature === lastReportedPageSignature) return;
   lastReportedPageSignature = pageSignature;
   const pageState = pageSignature.slice(pageSignature.indexOf(':') + 1);
   bridge.send(ExtensionProtocol.MESSAGE_TYPES.CONTENT_READY, { pageKind: detectPageKind(), pageState }).catch(() => {});
@@ -296,6 +313,8 @@ const reportRemoteResult = async (actionId, action, status, reason) => {
     status,
     reason,
     toastMessage: remoteActionToastMessages.get(actionId) || (action === 'question' ? '答题完成' : '签到完成'),
+    resumeMode: result?.resumeMode,
+    pageState: result?.pageState,
   };
   if (result?.delivered === true && !pendingResult) return true;
   if (reportingRemoteActions.has(actionId)) return false;
@@ -309,6 +328,8 @@ const reportRemoteResult = async (actionId, action, status, reason) => {
           action: payload.action,
           status: payload.status,
           reason: payload.reason,
+          resumeMode: payload.resumeMode,
+          pageState: payload.pageState,
         });
         if (response?.ok === true && response?.accepted === true && (!response?.actionId || response.actionId === actionId)) {
           return finalizeDeliveredRemoteResult(actionId, payload);
@@ -325,24 +346,26 @@ const reportRemoteResult = async (actionId, action, status, reason) => {
     reportingRemoteActions.delete(actionId);
   }
 };
-const finishRemoteAction = (actionId, action, status, reason) => {
+const finishRemoteAction = (actionId, action, status, reason, extra = {}) => {
   const toastMessage = remoteActionToastMessages.get(actionId) || (action === 'question' ? '答题完成' : '签到完成');
   if (!actionId) {
     activeRemoteActionId = null;
     if (status === 'success') showCheckinToast(toastMessage);
     return;
   }
-  remoteActionResults.set(actionId, { action, status, reason, delivered: false, toastMessage });
+  remoteActionResults.set(actionId, { action, status, reason, delivered: false, toastMessage, ...extra });
   remoteActionTimers.delete(actionId);
   pendingRemoteActions.delete(actionId);
   if (activeRemoteActionId === actionId) activeRemoteActionId = null;
   reportRemoteResult(actionId, action, status, reason).catch(() => {});
 };
 const pauseRemoteAction = (actionId, action, reason) => {
+  const toastMessage = remoteActionToastMessages.get(actionId) || (action === 'question' ? '答题完成' : '签到完成');
   if (!actionId) {
     activeRemoteActionId = null;
     return;
   }
+  remoteActionResults.set(actionId, { action, status: 'login-blocked', reason, delivered: false, toastMessage });
   remoteActionTimers.delete(actionId);
   pendingRemoteActions.delete(actionId);
   if (activeRemoteActionId === actionId) activeRemoteActionId = null;
@@ -366,10 +389,53 @@ const readNodeAttributes = (node) => {
     .join(' ');
 };
 const hasShadowTree = (node) => Boolean(node?.shadowRoot && (node.shadowRoot.children?.length || node.shadowRoot.querySelector?.('*')));
+const CF_INTERACTIVE_LABEL_RE = /verify you are human|confirm you are human|verification required|widget containing a cloudflare security challenge|cloudflare security challenge/i;
+const CF_INTERSTITIAL_RE = /just a moment|checking your browser|attention required/i;
+const CF_TURNSTILE_RE = /challenges\.cloudflare\.com|cf-turnstile|(?:^|\s)cf-chl-widget(?:\s|$)/i;
+const readCloudflareWidgetLabel = (node, attrs = readNodeAttributes(node)) => (
+  `${String(node?.getAttribute?.('title') || '')} ${String(node?.getAttribute?.('aria-label') || '')} ${attrs}`
+);
 const isPassiveCloudflareTurnstile = (node) => {
   const attrs = readNodeAttributes(node);
-  return /challenges\.cloudflare\.com|cf-turnstile|(?:^|\s)cf-chl-widget(?:\s|$)/i.test(attrs)
-    && !/challenge-error-text|challenge-stage/i.test(attrs);
+  if (!CF_TURNSTILE_RE.test(attrs)) return false;
+  if (/challenge-error-text|challenge-stage/i.test(attrs)) return false;
+  if (CF_INTERACTIVE_LABEL_RE.test(readCloudflareWidgetLabel(node, attrs))) return false;
+  return true;
+};
+const hasTaskControlsForCloudflare = (action = null) => {
+  if (action === 'question' || (!action && isQuestionPage())) {
+    const question = DailyQuestionPage.findQuestion?.(document) || {};
+    const options = DailyQuestionPage.findOptions?.(document, DailyQuestionPage.findQuestionContainer?.(document)) || [];
+    return Boolean(cleanTextValue(question.value) || question.node) && options.length > 0;
+  }
+  return Boolean(DailyCheckinPage.findDefault?.());
+};
+const classifyCloudflareState = (taskRoot = null, action = null) => {
+  const root = taskRoot || document?.body || null;
+  const title = String(document?.title || '');
+  const pageText = `${title} ${readNodeText(root)}`.trim();
+  let hasTurnstile = false;
+  let interactiveWidget = false;
+  let challengeError = false;
+  let challengeStage = false;
+  walkScopeNodes(document?.body || root, (node) => {
+    const attrs = readNodeAttributes(node);
+    const nodeText = readNodeText(node);
+    if (/challenge-error-text/i.test(`${attrs} ${nodeText}`)) challengeError = true;
+    if (/challenge-stage/i.test(attrs)) challengeStage = true;
+    if (CF_INTERACTIVE_LABEL_RE.test(nodeText)) interactiveWidget = true;
+    if (CF_TURNSTILE_RE.test(attrs)) {
+      hasTurnstile = true;
+      if (CF_INTERACTIVE_LABEL_RE.test(readCloudflareWidgetLabel(node, attrs))) interactiveWidget = true;
+    }
+    return false;
+  });
+  if (challengeError || interactiveWidget || CF_INTERACTIVE_LABEL_RE.test(pageText)) return 'interactive';
+  const interstitial = CF_INTERSTITIAL_RE.test(title) || CF_INTERSTITIAL_RE.test(pageText) || challengeStage;
+  const controls = hasTaskControlsForCloudflare(action);
+  if (interstitial && !controls) return 'interstitial-pending';
+  if (hasTurnstile && controls) return 'passive-turnstile';
+  return 'none';
 };
 const walkScopeNodes = (root, visitor) => {
   const queue = [root];
@@ -426,36 +492,28 @@ const hasConservativeCaptchaPrompt = (taskRoot) => {
   });
   return hasDirectPromptControl || hasSuspiciousWidget;
 };
-const hasPageCaptchaChallenge = (taskRoot = null) => {
+const hasPageCaptchaChallenge = (taskRoot = null, action = null) => {
+  const classified = classifyCloudflareState(taskRoot, action);
+  if (classified === 'interactive') return true;
+  if (classified === 'interstitial-pending' || classified === 'passive-turnstile') return false;
   const title = String(document?.title || '');
   const cloudflareTitle = /just a moment|checking your browser|attention required|cloudflare/i.test(title);
-  // Do not treat every Cloudflare Turnstile iframe as a hard block: a
-  // challenge can be mounted before the site auto-resolves it. Inspect the
-  // actual node attributes so a normal CAPTCHA iframe still fails closed.
   let activeChallenge = false;
-  let hasCloudflareTurnstile = false;
   walkScopeNodes(document?.body || taskRoot, (node) => {
     const tagName = String(node?.tagName || '').toUpperCase();
     const attrs = readNodeAttributes(node);
-    const cloudflareTurnstile = /challenges\.cloudflare\.com|cf-turnstile|turnstile/i.test(attrs);
-    if (cloudflareTurnstile) {
-      hasCloudflareTurnstile = true;
-      return false;
-    }
+    if (CF_TURNSTILE_RE.test(attrs) || isPassiveCloudflareTurnstile(node)) return false;
     if (tagName === 'IFRAME' && /captcha|recaptcha|hcaptcha|geetest/i.test(attrs)) { activeChallenge = true; return true; }
     if (/(?:^|\s)(?:cf-chl-widget|g-recaptcha|geetest[-_]?holder|captcha[-_]?modal)(?:\s|$)/i.test(attrs) || /challenge-stage|challenge-error-text|captcha_box/i.test(attrs)) {
       activeChallenge = true;
       return true;
     }
     if (CAPTCHA_ATTR_RE.test(attrs) && !/^(?:INPUT|TEXTAREA)$/i.test(tagName)) {
-      // A descriptive data-widget/host is evidence of a challenge, while a
-      // bare text label is handled by the stronger page-text check below.
       activeChallenge = true;
       return true;
     }
     return false;
   });
-  if (cloudflareTitle && hasCloudflareTurnstile) return false;
   if (cloudflareTitle) return true;
   if (activeChallenge) return true;
   const scopeText = readNodeText(taskRoot || document.body);
@@ -474,6 +532,34 @@ const getRemoteResultScope = (action) => {
     || document.querySelector?.('main')
     || document.body;
 };
+const waitForChallengeGate = (action) => new Promise((resolve) => {
+  const started = Date.now();
+  const taskRoot = getRemoteResultScope(action);
+  const finish = (result) => {
+    clearInterval(timer);
+    resolve(result);
+  };
+  const tick = () => {
+    const classified = classifyCloudflareState(taskRoot, action);
+    if (classified === 'interactive') {
+      finish({ ok: false, reason: 'captcha-required' });
+      return;
+    }
+    if ((classified === 'none' || classified === 'passive-turnstile') && hasTaskControlsForCloudflare(action)) {
+      finish({ ok: true });
+      return;
+    }
+    if (Date.now() - started >= CAPTCHA_GRACE_PERIOD_MS) {
+      if ((classified === 'none' || classified === 'passive-turnstile') && hasTaskControlsForCloudflare(action)) {
+        finish({ ok: true });
+        return;
+      }
+      finish({ ok: false, reason: 'captcha-required' });
+    }
+  };
+  const timer = setInterval(tick, 200);
+  tick();
+});
 const COMPLETION_TOAST_SELECTOR = '[role="status"], [role="alert"], [class*="toast"], [class*="message"], [class*="notification"]';
 const readCompletionToastText = (root = document) => Array.from(root.querySelectorAll?.(COMPLETION_TOAST_SELECTOR) || [])
   .filter((node) => !node.closest?.('#p3a-daily-question-helper, #p3a-daily-checkin-helper'))
@@ -485,6 +571,12 @@ const waitForRemoteResult = (action, actionId, status) => new Promise((resolve) 
   let captchaFirstSeenAt = null;
 
   const timer = setInterval(() => {
+    if (actionId && remoteActionResults.has(actionId)) {
+      const result = remoteActionResults.get(actionId);
+      clearInterval(timer);
+      resolve(result.status === 'success');
+      return;
+    }
     const state = action === 'question' ? DailyQuestionPage.getState() : DailyCheckinPage.getState();
     const taskRoot = getRemoteResultScope(action);
     const scopedBody = String(taskRoot?.innerText || taskRoot?.textContent || '');
@@ -513,7 +605,14 @@ const waitForRemoteResult = (action, actionId, status) => new Promise((resolve) 
       clearInterval(timer); finishRemoteAction(actionId, action, 'success', 'completed'); resolve(true); return;
     }
 
-    const hasCaptchaPrompt = hasConservativeCaptchaPrompt(taskRoot);
+    const classified = classifyCloudflareState(taskRoot, action);
+    if (classified === 'interactive') {
+      clearInterval(timer);
+      finishRemoteAction(actionId, action, 'failed', 'captcha-required', { resumeMode: 'join', pageState: detectPageState() });
+      resolve(false);
+      return;
+    }
+    const hasCaptchaPrompt = classified === 'interstitial-pending' || hasConservativeCaptchaPrompt(taskRoot);
 
     // 3. Cloudflare / Captcha challenge check with grace period for automatic resolution
     if (hasCaptchaPrompt) {
@@ -522,7 +621,13 @@ const waitForRemoteResult = (action, actionId, status) => new Promise((resolve) 
       }
       // If the challenge persists past the grace period, treat it as a true Hard Block
       if (Date.now() - captchaFirstSeenAt >= CAPTCHA_GRACE_PERIOD_MS) {
-        clearInterval(timer); finishRemoteAction(actionId, action, 'failed', 'captcha-required'); resolve(false); return;
+        clearInterval(timer);
+        finishRemoteAction(actionId, action, 'failed', 'captcha-required', {
+          resumeMode: classified === 'interstitial-pending' ? 'join' : 'replay',
+          pageState: detectPageState(),
+        });
+        resolve(false);
+        return;
       }
       // While captcha is active and within grace period, keep polling in background
       return;
@@ -630,18 +735,49 @@ const waitForStableQuestionSnapshot = async (startedAt, deadlineMs = REMOTE_ACTI
   }
   return { ok: false, reason: 'question-not-ready' };
 };
-const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) => {
+const runQuestionAction = async ({ actionId = null, workflowId = null, resumeMode = null } = {}) => {
   if (actionId) {
     pendingRemoteActions.add(actionId);
     activeRemoteActionId = actionId;
     remoteActionToastMessages.set(actionId, workflowId ? '签到和答题完成' : '答题完成');
     answerActionId = actionId;
+  } else {
+    localQuestionSubmitInFlight = true;
   }
   const status = questionStatusNode || { textContent: '' };
-  const failRemote = actionId ? (reason) => finishRemoteAction(actionId, 'question', 'failed', reason) : () => {};
+  const failRemote = (reason, extra = {}) => {
+    if (actionId) {
+      finishRemoteAction(actionId, 'question', 'failed', reason, extra);
+      return;
+    }
+    for (const id of [...pendingRemoteActions]) {
+      finishRemoteAction(id, 'question', 'failed', reason, extra);
+    }
+  };
   try {
-    if (hasPageCaptchaChallenge(getRemoteResultScope('question'))) {
-      failRemote('captcha-required');
+    if (resumeMode === 'join' && actionId) {
+      if (DailyQuestionPage.getState() === 'completed') {
+        finishRemoteAction(actionId, 'question', 'success', 'already-completed');
+        status.textContent = '已完成：今日已答题';
+        return;
+      }
+      status.textContent = '已一键答题，等待站点结果';
+      await waitForRemoteResult('question', actionId, status);
+      return;
+    }
+    if (actionId && localQuestionSubmitInFlight) {
+      if (DailyQuestionPage.getState() === 'completed') {
+        finishRemoteAction(actionId, 'question', 'success', 'already-completed');
+        status.textContent = '已完成：今日已答题';
+        return;
+      }
+      status.textContent = '已一键答题，等待站点结果';
+      await waitForRemoteResult('question', actionId, status);
+      return;
+    }
+    const gate = await waitForChallengeGate('question');
+    if (!gate.ok) {
+      failRemote('captcha-required', { resumeMode: 'replay', pageState: detectPageState() });
       status.textContent = '页面需要安全验证，请手动完成，未提交';
       return;
     }
@@ -652,7 +788,10 @@ const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) =>
       const snapshot = await waitForStableQuestionSnapshot(startedAt, questionReadyTimeoutMs);
       if (!snapshot.ok) {
         if (snapshot.reason === 'requires-login') {
-          pauseRemoteAction(actionId, 'question', 'requires-login');
+          if (actionId) pauseRemoteAction(actionId, 'question', 'requires-login');
+          else {
+            for (const id of [...pendingRemoteActions]) pauseRemoteAction(id, 'question', 'requires-login');
+          }
           status.textContent = '需登录：登录后会自动继续答题';
           return;
         }
@@ -752,31 +891,83 @@ const runQuestionAction = async ({ actionId = null, workflowId = null } = {}) =>
     answerActionId = null;
     failRemote('action-failed');
     status.textContent = '一键答题未完成，请重试或按站点提示手动操作';
+  } finally {
+    if (!actionId) localQuestionSubmitInFlight = false;
   }
 };
-const runCheckinAction = async ({ actionId = null } = {}) => {
+const runCheckinAction = async ({ actionId = null, resumeMode = null } = {}) => {
   if (actionId) {
     pendingRemoteActions.add(actionId);
     activeRemoteActionId = actionId;
     checkinActionId = actionId;
+  } else {
+    localCheckinSubmitInFlight = true;
   }
   const status = checkinStatusNode || { textContent: '' };
-  const failRemote = actionId ? (reason) => finishRemoteAction(actionId, 'checkin', 'failed', reason) : () => {};
+  const failRemote = (reason, extra = {}) => {
+    if (actionId) {
+      finishRemoteAction(actionId, 'checkin', 'failed', reason, extra);
+      return;
+    }
+    for (const id of [...pendingRemoteActions]) {
+      finishRemoteAction(id, 'checkin', 'failed', reason, extra);
+    }
+  };
   try {
-    if (hasPageCaptchaChallenge(getRemoteResultScope('checkin'))) {
-      failRemote('captcha-required');
+    if (resumeMode === 'join' && actionId) {
+      if (DailyCheckinPage.getState() === 'completed') {
+        finishRemoteAction(actionId, 'checkin', 'success', 'already-completed');
+        status.textContent = '已完成：今日已签到';
+        return;
+      }
+      status.textContent = '已一键签到，等待站点结果';
+      await waitForRemoteResult('checkin', actionId, status);
+      return;
+    }
+    if (actionId && localCheckinSubmitInFlight) {
+      if (DailyCheckinPage.getState() === 'completed') {
+        finishRemoteAction(actionId, 'checkin', 'success', 'already-completed');
+        status.textContent = '已完成：今日已签到';
+        return;
+      }
+      status.textContent = '已一键签到，等待站点结果';
+      await waitForRemoteResult('checkin', actionId, status);
+      return;
+    }
+    if (actionId && checkinActionKey) {
+      if (DailyCheckinPage.getState() === 'completed') {
+        finishRemoteAction(actionId, 'checkin', 'success', 'already-completed');
+        status.textContent = '已完成：今日已签到';
+        return;
+      }
+      status.textContent = '已一键签到，等待站点结果';
+      await waitForRemoteResult('checkin', actionId, status);
+      return;
+    }
+    const gate = await waitForChallengeGate('checkin');
+    if (!gate.ok) {
+      failRemote('captcha-required', { resumeMode: 'replay', pageState: detectPageState() });
       status.textContent = '页面需要安全验证，请手动完成，未提交';
       return;
     }
     const currentState = DailyCheckinPage.getState();
-    if (currentState === 'requires-login') { pauseRemoteAction(actionId, 'checkin', 'requires-login'); status.textContent = '需登录：登录后会自动继续签到'; return; }
+    if (currentState === 'requires-login') {
+      if (actionId) pauseRemoteAction(actionId, 'checkin', 'requires-login');
+      else {
+        for (const id of [...pendingRemoteActions]) pauseRemoteAction(id, 'checkin', 'requires-login');
+      }
+      status.textContent = '需登录：登录后会自动继续签到';
+      return;
+    }
     if (currentState === 'completed') { finishRemoteAction(actionId, 'checkin', 'success', 'already-completed'); status.textContent = '已完成：今日已签到'; return; }
     const current = DailyCheckinPage.findDefault();
     if (!current) { failRemote('default-option-not-found'); status.textContent = '未找到“没心情”默认选项，未提交'; return; }
     const signature = CheckinState.nodeSignature(current);
     const key = `${actionId || 'local'}:${location.href}:${signature}`;
     if (checkinActionKey === key) { failRemote('duplicate-action'); status.textContent = '已一键签到，等待站点结果'; return; }
-    current.click();
+    const alreadySelected = Boolean(CheckinState.reconcile(checkinPrepared, location.href, current))
+      || DailyCheckinPage.isDefaultSelected?.(current) === true;
+    if (!alreadySelected) current.click();
     // Selecting a mood can cause the site to re-render the submit button.
     // Always resolve the live site-owned button after the selection event.
     const submit = await waitForCheckinSubmit();
@@ -800,6 +991,8 @@ const runCheckinAction = async ({ actionId = null } = {}) => {
     checkinActionId = null;
     failRemote('action-failed');
     status.textContent = '一键签到未完成，请重试或按站点提示手动操作';
+  } finally {
+    if (!actionId) localCheckinSubmitInFlight = false;
   }
 };
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -807,6 +1000,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const action = message.payload?.action;
   const actionId = typeof message.payload?.actionId === 'string' && message.payload.actionId ? message.payload.actionId : null;
   const workflowId = message.payload?.workflowId ?? null;
+  const resumeMode = message.payload?.resumeMode === 'join' ? 'join' : (message.payload?.resumeMode === 'replay' ? 'replay' : null);
   if (!actionId) return false;
   if (!['question', 'checkin'].includes(action)) return false;
   const accept = (extra = {}) => {
@@ -827,9 +1021,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   pendingRemoteActions.add(actionId);
   remoteActionTimers.delete(actionId);
   if (action === 'question') {
-    runQuestionAction({ actionId, workflowId }).catch(() => {});
+    runQuestionAction({ actionId, workflowId, resumeMode }).catch(() => {});
   } else {
-    runCheckinAction({ actionId }).catch(() => {});
+    runCheckinAction({ actionId, resumeMode }).catch(() => {});
   }
   return accept();
 });
@@ -932,10 +1126,11 @@ const render = async () => {
       status.textContent = `已命中：${result.answerText}，请手动选择`;
     }
   }
-  if (result.matchType === 'exact' && autoSubmitKey !== questionKey && !activeRemoteActionId && !pendingRemoteActions.size) {
+  if (result.matchType === 'exact' && autoSubmitKey !== questionKey && !activeRemoteActionId && !pendingRemoteActions.size && !localQuestionSubmitInFlight) {
     const liveSelected = DailyQuestionPage.findSelectedOption(document, optionNodes);
     if (liveSelected === target && DailyQuestionPage.findSubmit()) {
       autoSubmitKey = questionKey;
+      localQuestionSubmitInFlight = true;
       status.textContent = `已自动选中：${result.answerText}，正在提交`;
       runQuestionAction().catch(() => {});
     }
@@ -980,7 +1175,7 @@ const renderCheckin = () => {
   if (!checkinAutoAttempt) {
     checkinAutoAttempt = autoKey;
     try {
-      defaultNode.click();
+      if (!DailyCheckinPage.isDefaultSelected(defaultNode)) defaultNode.click();
       checkinPrepared = CheckinState.prepare(defaultNode, location.href);
       confirm.disabled = false;
       status.textContent = '已自动选择：没心情，请检查后确认签到';
@@ -1019,7 +1214,12 @@ const renderCheckin = () => {
     if (activeRemoteActionId || pendingRemoteActions.size) { status.textContent = '后台任务进行中，请等待结果'; return; }
     const remoteActionId = activeRemoteActionId;
     activeRemoteActionId = null;
-    const failRemote = (reason) => finishRemoteAction(remoteActionId, 'checkin', 'failed', reason);
+    const failRemote = (reason) => {
+      if (remoteActionId) finishRemoteAction(remoteActionId, 'checkin', 'failed', reason);
+      for (const id of [...pendingRemoteActions]) {
+        if (id !== remoteActionId) finishRemoteAction(id, 'checkin', 'failed', reason);
+      }
+    };
     const currentState = DailyCheckinPage.getState();
     const current = DailyCheckinPage.findDefault();
     const signature = CheckinState.nodeSignature(current);
@@ -1028,8 +1228,14 @@ const renderCheckin = () => {
     if (currentState === 'completed') { finishRemoteAction(remoteActionId, 'checkin', 'success', 'already-completed'); status.textContent = '今日已签到'; return; }
     if (!current) { failRemote('default-option-not-found'); status.textContent = '未找到“没心情”默认选项，未提交'; return; }
     if (key === checkinActionKey) { failRemote('duplicate-action'); status.textContent = '一键签到已执行，等待站点结果'; return; }
+    localCheckinSubmitInFlight = true;
     try {
-      if (!CheckinState.reconcile(checkinPrepared, location.href, current)) { current.click(); checkinPrepared = CheckinState.prepare(current, location.href); }
+      const alreadySelected = Boolean(CheckinState.reconcile(checkinPrepared, location.href, current))
+        || DailyCheckinPage.isDefaultSelected?.(current) === true;
+      if (!alreadySelected) {
+        current.click();
+        checkinPrepared = CheckinState.prepare(current, location.href);
+      }
       const submit = await waitForCheckinSubmit();
       if (!submit) { failRemote('submit-not-found'); status.textContent = '未找到站点签到按钮，未提交'; return; }
       const latestState = DailyCheckinPage.getState();
@@ -1043,6 +1249,7 @@ const renderCheckin = () => {
       submit.click(); checkinActionKey = key; checkinPrepared = null; status.textContent = '已提交，等待签到结果（如有验证码请完成）';
       await waitForRemoteResult('checkin', remoteActionId, status);
     } catch { checkinActionKey = null; failRemote('action-failed'); status.textContent = '一键签到未完成，请重试或按站点提示手动操作'; }
+    finally { localCheckinSubmitInFlight = false; }
   });
   bar.append(oneClick, prepare, confirm);
 };
@@ -1075,7 +1282,7 @@ if (isQuestionPage() || isCheckinPage()) {
     reportContentReady();
     if (isQuestionPage()) schedule();
     if (isCheckinPage()) scheduleCheckin();
-  }).observe(observationRoot, { childList: true, subtree: true, characterData: true });
+  }).observe(observationRoot, { childList: true, subtree: true, characterData: true, attributes: true });
   if (isQuestionPage()) { schedule(); retryInitialQuestionRender(); }
   if (isCheckinPage()) scheduleCheckin();
 }

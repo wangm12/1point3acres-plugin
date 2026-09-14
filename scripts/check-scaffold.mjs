@@ -36,6 +36,7 @@ const requiredPaths = [
   'src/shared/protocol.js',
   'src/shared/question-matcher.js',
   'src/shared/learned-answers.js',
+  'src/shared/action-indicator.js',
   'src/shared/daily-question-page.js',
   'src/shared/daily-checkin-page.js',
   'src/shared/checkin-state.js',

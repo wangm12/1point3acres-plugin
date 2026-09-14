@@ -26,6 +26,7 @@ assert.match(popup, /id="run-everything"/);
 assert.match(popup, /id="run-checkin"/);
 assert.match(popup, /id="run-question"/);
 assert.match(popup, /id="alert-banner"/);
+assert.doesNotMatch(popup, /id="run-progress"|id="step-checkin"/);
 assert.doesNotMatch(popup, /打开每日答题|打开每日签到|open-question|open-checkin/);
 assert.doesNotMatch(popupJs, /openPage|window\.open|无法打开/);
 assert.match(readme, /10 个成功来源、1304 条 raw records、198 个 normalized entries、11 个 ambiguous entries、4 个 cross-source conflicts/);

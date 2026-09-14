@@ -10,6 +10,8 @@ const worker = read('src/service-worker.js');
 
 assert.match(protocol, /RUN_ONE_CLICK: 'RUN_ONE_CLICK'/);
 assert.match(protocol, /CONTENT_READY: 'CONTENT_READY'/);
+assert.match(worker, /importScripts\('shared\/action-indicator.js'\)/);
+assert.match(worker, /syncActionIndicator/);
 assert.match(worker, /coordinatorStart/);
 assert.match(worker, /coordinatorActionResult/);
 assert.match(worker, /coordinatorFinalize/);

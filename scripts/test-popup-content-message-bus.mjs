@@ -9,6 +9,7 @@ const workerSource = read('../src/service-worker.js');
 const protocolSource = read('../src/shared/protocol.js');
 const questionMatcherSource = read('../src/shared/question-matcher.js');
 const learnedAnswersSource = read('../src/shared/learned-answers.js');
+const actionIndicatorSource = read('../src/shared/action-indicator.js');
 const questionPageSource = read('../src/shared/daily-question-page.js');
 const checkinPageSource = read('../src/shared/daily-checkin-page.js');
 const checkinStateSource = read('../src/shared/checkin-state.js');
@@ -80,7 +81,7 @@ const chrome = {
     getAll: async () => [],
     onAlarm: { addListener: () => {} },
   },
-  action: { setIcon: async () => {}, setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {} },
+  action: { setIcon: async () => {}, setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {}, setTitle: async () => {} },
   notifications: { create: async () => 'n1' },
 };
 
@@ -94,7 +95,12 @@ const workerContext = {
 vm.createContext(workerContext);
 workerContext.globalThis = workerContext;
 workerContext.importScripts = (...files) => files.forEach((file) => {
-  const source = file === 'shared/protocol.js' ? protocolSource : file === 'shared/question-matcher.js' ? questionMatcherSource : learnedAnswersSource;
+  const source = file === 'shared/protocol.js' ? protocolSource
+    : file === 'shared/question-matcher.js' ? questionMatcherSource
+    : file === 'shared/learned-answers.js' ? learnedAnswersSource
+    : file === 'shared/action-indicator.js' ? actionIndicatorSource
+    : null;
+  if (!source) throw new Error(`unknown importScripts: ${file}`);
   vm.runInContext(source, workerContext);
 });
 vm.runInContext(workerSource, workerContext);

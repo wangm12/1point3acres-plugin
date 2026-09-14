@@ -1,6 +1,7 @@
 importScripts('shared/protocol.js');
 importScripts('shared/question-matcher.js');
 importScripts('shared/learned-answers.js');
+importScripts('shared/action-indicator.js');
 
 const RUNTIME_STORAGE_KEY = 'p3a-runtime-v1';
 const RUNTIME_FINALIZE_ALARM_PREFIX = 'p3a-runtime-finalize:';
@@ -8,6 +9,8 @@ const RUNTIME_FINALIZE_ALARM_DELAY_MS = 30 * 1000;
 const AUTO_STORAGE_KEY = 'p3a-auto-scheduler-v1';
 const AUTO_ALARM_NAME = 'p3a-auto-schedule';
 const AUTO_RETRY_ALARM_PREFIX = 'p3a-auto-retry:';
+const REUSE_RELOAD_ALARM_PREFIX = 'p3a-reuse-reload:';
+const REUSE_RELOAD_TIMEOUT_MS = 8000;
 const AUTO_ALARM_MIN_DELAY_MS = 30 * 1000;
 const DELIVERY_RETRY_LIMIT = 4;
 const DELIVERY_RETRY_DELAY_MS = 250;
@@ -58,6 +61,13 @@ let autoState = null;
 let startEverythingPromise = null;
 let startAutoEverythingPromise = null;
 const loginBlockedRefreshByTabId = new Map();
+const captchaBlockedRefreshByTabId = new Map();
+const isCaptchaBlockedResult = (result) => {
+  const status = result?.status;
+  const reason = result?.reason;
+  return status === 'captcha-required' || status === 'captcha-error' || reason === 'captcha-required' || reason === 'captcha-error';
+};
+const captchaResumeMode = (result) => (result?.resumeMode === 'join' ? 'join' : 'replay');
 const runtimeStorage = chrome.storage.session || chrome.storage.local;
 const autoStorage = chrome.storage.local;
 let coordinatorTail = Promise.resolve();
@@ -71,7 +81,8 @@ const clearRuntimeFinalizationAlarms = async () => {
   const alarms = await chrome.alarms.getAll().catch(() => []);
   let cleared = false;
   for (const alarm of Array.isArray(alarms) ? alarms : []) {
-    if (typeof alarm?.name !== 'string' || !alarm.name.startsWith(RUNTIME_FINALIZE_ALARM_PREFIX)) continue;
+    if (typeof alarm?.name !== 'string') continue;
+    if (!alarm.name.startsWith(RUNTIME_FINALIZE_ALARM_PREFIX) && !alarm.name.startsWith(REUSE_RELOAD_ALARM_PREFIX)) continue;
     cleared = Boolean(await chrome.alarms.clear(alarm.name).catch(() => false)) || cleared;
   }
   return cleared;
@@ -280,6 +291,7 @@ const normalizeActionRecord = (record) => {
     lastResult: record.lastResult && typeof record.lastResult === 'object' ? clone(record.lastResult) : null,
     createdByExtension: hasCreatedByExtension ? record.createdByExtension === true : null,
     reusedExistingTab: hasReusedExistingTab ? record.reusedExistingTab === true : null,
+    reloadAttempted: record.reloadAttempted === true,
     finalizationPending: record.finalizationPending === true,
     closeStatus: typeof record.closeStatus === 'string' ? record.closeStatus : null,
     closeSkippedReason: typeof record.closeSkippedReason === 'string' ? record.closeSkippedReason : null,
@@ -453,6 +465,7 @@ const loadRuntimeState = async () => {
 const saveRuntimeState = async () => {
   await loadRuntimeState();
   await runtimeStorage.set({ [RUNTIME_STORAGE_KEY]: runtimeState });
+  await syncActionIndicator().catch(() => {});
 };
 
 const getRunState = () => runtimeState?.run || defaultRuntimeState().run;
@@ -579,7 +592,10 @@ const recoverAutoCurrentRun = async ({ now = new Date(), originActiveTabId = nul
       originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId,
     });
     await saveRuntimeState();
-    await retryDeliverIfNeeded(reusable.id, { force: true }).catch((error) => setRunError(error, 'auto-recover-deliver-failed'));
+    await deliverToTaskTab(reusable.id, {
+      action: stage,
+      originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId,
+    }).catch((error) => setRunError(error, 'auto-recover-deliver-failed'));
     return { ok: true, tab: reusable, run: runtimeState.run, reused: true };
   }
   const page = actionPage('checkin');
@@ -599,7 +615,7 @@ const recoverAutoCurrentRun = async ({ now = new Date(), originActiveTabId = nul
 const findExistingTaskTab = async (page, { workflow = false } = {}) => {
   const tabs = await chrome.tabs.query({}).catch(() => []);
   if (!Array.isArray(tabs)) return null;
-  return tabs.find((tab) => {
+  const matches = tabs.filter((tab) => {
     if (!isTargetUrl(tab.url, page)) return false;
     if (!workflow) return true;
     const record = getActionRecord(tab.id) || getAwaitingRecord(tab.id);
@@ -607,7 +623,10 @@ const findExistingTaskTab = async (page, { workflow = false } = {}) => {
     // currently visible task page, but must not silently take over an
     // unrelated background tab.
     return tab.active === true || record?.createdByExtension === true;
-  }) || null;
+  });
+  const active = matches.find((tab) => tab.active === true);
+  if (active) return active;
+  return matches[0] || null;
 };
 const activateCoordinatorRun = async ({ source, stage, mode = stage, tabId, originActiveTabId, actionId, transition }) => {
   await loadRuntimeState();
@@ -875,6 +894,82 @@ const getAutoStatePayload = async () => {
   };
 };
 
+const iconBitmapByUrl = new Map();
+let lastActionIndicatorKey = '';
+
+const loadIconBitmap = async (url) => {
+  if (!url || typeof fetch !== 'function' || typeof createImageBitmap !== 'function') return null;
+  if (iconBitmapByUrl.has(url)) return iconBitmapByUrl.get(url);
+  const response = await fetch(url).catch(() => null);
+  if (!response?.ok || typeof response.blob !== 'function') return null;
+  const blob = await response.blob().catch(() => null);
+  if (!blob) return null;
+  const bitmap = await createImageBitmap(blob).catch(() => null);
+  if (!bitmap) return null;
+  iconBitmapByUrl.set(url, bitmap);
+  return bitmap;
+};
+
+const paintActionIndicatorIcon = async (desc) => {
+  if (typeof chrome.action?.setIcon !== 'function') return false;
+  const showDots = desc?.checkin !== 'hidden' || desc?.question !== 'hidden';
+  if (!showDots || typeof OffscreenCanvas !== 'function') return false;
+  const paths = resolveActionIconPaths(desc.enabled ? ACTION_ICON_PATHS.enabled : ACTION_ICON_PATHS.disabled);
+  const imageData = {};
+  for (const size of [16, 32]) {
+    const bitmap = await loadIconBitmap(paths[size]);
+    if (!bitmap) return false;
+    const canvas = new OffscreenCanvas(size, size);
+    const ctx = canvas.getContext('2d');
+    if (!ctx || typeof ctx.getImageData !== 'function') return false;
+    ctx.drawImage(bitmap, 0, 0, size, size);
+    ActionIndicator.drawIndicatorDots(ctx, size, desc.checkin, desc.question);
+    imageData[size] = ctx.getImageData(0, 0, size, size);
+  }
+  await chrome.action.setIcon({ imageData });
+  return true;
+};
+
+const applyActionIndicator = async (desc) => {
+  if (typeof chrome.action?.setBadgeText === 'function') {
+    await chrome.action.setBadgeText({ text: desc.badgeText || '' }).catch(() => {});
+    if (desc.badgeText && typeof chrome.action.setBadgeBackgroundColor === 'function') {
+      await chrome.action.setBadgeBackgroundColor({ color: desc.badgeColor || ActionIndicator.BADGE_COLORS.running }).catch(() => {});
+    }
+    if (typeof chrome.action.setBadgeTextColor === 'function') {
+      await chrome.action.setBadgeTextColor({ color: '#ffffff' }).catch(() => {});
+    }
+  }
+  if (typeof chrome.action?.setTitle === 'function') {
+    await chrome.action.setTitle({ title: desc.title || ActionIndicator.DEFAULT_TITLE }).catch(() => {});
+  }
+  const painted = await paintActionIndicatorIcon(desc).catch(() => false);
+  if (!painted) await syncActionIcon(Boolean(desc.enabled)).catch(() => {});
+  return true;
+};
+
+const collectActionIndicatorRecords = () => [
+  ...Object.values(runtimeState?.actionsByTabId || {}),
+  ...Object.values(runtimeState?.awaitingContentByTabId || {}),
+];
+
+const syncActionIndicator = async () => {
+  if (typeof chrome.action?.setBadgeText !== 'function' && typeof chrome.action?.setIcon !== 'function') return false;
+  await loadRuntimeState();
+  if (!autoState) await loadAutoState();
+  const desc = ActionIndicator.describeActionIndicator({
+    run: getRunState(),
+    dailyStatus: runtimeState?.dailyStatus,
+    actions: collectActionIndicatorRecords(),
+    autoEnabled: Boolean(autoState?.enabled),
+  });
+  const key = JSON.stringify(desc);
+  if (key === lastActionIndicatorKey) return true;
+  await applyActionIndicator(desc);
+  lastActionIndicatorKey = key;
+  return true;
+};
+
 const syncActionIcon = async (enabled) => {
   if (typeof chrome.action?.setIcon !== 'function') return false;
   const iconPaths = resolveActionIconPaths(enabled ? ACTION_ICON_PATHS.enabled : ACTION_ICON_PATHS.disabled);
@@ -883,8 +978,8 @@ const syncActionIcon = async (enabled) => {
 };
 
 const syncActionIconFromState = async () => {
-  const state = await loadAutoState();
-  await syncActionIcon(Boolean(state?.enabled));
+  await loadAutoState();
+  await syncActionIndicator();
 };
 
 // A worker can be re-evaluated without a browser restart, so onStartup is not
@@ -899,7 +994,8 @@ const setAutoState = async (patch = {}) => {
   await loadAutoState();
   autoState = normalizeAutoState({ ...autoState, ...patch });
   await saveAutoState();
-  await syncActionIcon(Boolean(autoState.enabled)).catch(() => {});
+  lastActionIndicatorKey = '';
+  await syncActionIndicator().catch(() => {});
   return autoState;
 };
 
@@ -952,7 +1048,8 @@ const resyncAutoSchedule = async ({ now = new Date() } = {}) => {
     await clearAutoAlarm();
     autoState.enabled = false;
     await saveAutoState();
-    await syncActionIcon(false).catch(() => {});
+    lastActionIndicatorKey = '';
+    await syncActionIndicator().catch(() => {});
     return autoState;
   }
   if (!autoState.plan || autoState.plan.dateKey !== todayKey || !Number.isFinite(autoState.plan.nextRunAt)) {
@@ -964,7 +1061,8 @@ const resyncAutoSchedule = async ({ now = new Date() } = {}) => {
     autoState.lastRunStatus = 'disabled';
     autoState.lastError = 'auto-schedule-not-configured';
     await saveAutoState();
-    await syncActionIcon(false).catch(() => {});
+    lastActionIndicatorKey = '';
+    await syncActionIndicator().catch(() => {});
     return autoState;
   }
   const scheduled = await scheduleAutoAlarm({ plan: autoState.plan });
@@ -974,7 +1072,8 @@ const resyncAutoSchedule = async ({ now = new Date() } = {}) => {
     autoState.lastRunStatus = 'disabled';
     autoState.lastError = autoState.lastError || 'alarm-create-failed';
     await saveAutoState();
-    await syncActionIcon(false).catch(() => {});
+    lastActionIndicatorKey = '';
+    await syncActionIndicator().catch(() => {});
   }
   return autoState;
 };
@@ -989,7 +1088,8 @@ const disableAutoSchedule = async () => {
   autoState.lastRunStatus = 'disabled';
   autoState.lastError = null;
   await saveAutoState();
-  await syncActionIcon(false).catch(() => {});
+  lastActionIndicatorKey = '';
+  await syncActionIndicator().catch(() => {});
   return autoState;
 };
 
@@ -1002,7 +1102,8 @@ const enableAutoSchedule = async ({ plan = null } = {}) => {
     autoState.lastError = 'auto-schedule-not-configured';
     autoState.lastRunStatus = 'disabled';
     await saveAutoState();
-    await syncActionIcon(false).catch(() => {});
+    lastActionIndicatorKey = '';
+    await syncActionIndicator().catch(() => {});
     return autoState;
   }
   const todayKey = getLosAngelesDateKey();
@@ -1016,7 +1117,8 @@ const enableAutoSchedule = async ({ plan = null } = {}) => {
     autoState.lastError = 'auto-plan-expired';
     autoState.lastRunStatus = 'skipped-stale';
     await saveAutoState();
-    await syncActionIcon(false).catch(() => {});
+    lastActionIndicatorKey = '';
+    await syncActionIndicator().catch(() => {});
     return autoState;
   }
   autoState.plan = {
@@ -1031,7 +1133,8 @@ const enableAutoSchedule = async ({ plan = null } = {}) => {
   const scheduled = await scheduleAutoAlarm({ plan: autoState.plan });
   if (!scheduled) autoState.enabled = false;
   await saveAutoState();
-  await syncActionIcon(Boolean(autoState.enabled)).catch(() => {});
+  lastActionIndicatorKey = '';
+  await syncActionIndicator().catch(() => {});
   return autoState;
 };
 
@@ -1048,7 +1151,8 @@ const completeAutoRun = async ({ status = 'completed', now = new Date(), result 
   await clearAutoAlarm();
   if (result) autoState.lastResult = result;
   await saveAutoState();
-  await syncActionIcon(false).catch(() => {});
+  lastActionIndicatorKey = '';
+  await syncActionIndicator().catch(() => {});
   return autoState;
 };
 
@@ -1080,7 +1184,8 @@ const pauseAutoRunForLogin = async ({ pending = null, result = null, now = new D
   autoState.enabled = false;
   await clearAutoAlarm();
   await saveAutoState();
-  await syncActionIcon(false).catch(() => {});
+  lastActionIndicatorKey = '';
+  await syncActionIndicator().catch(() => {});
   return autoState;
 };
 
@@ -1096,7 +1201,8 @@ const finalizeAutoRunFailure = async ({ pending = null, result = null, now = new
   autoState.enabled = false;
   await clearAutoAlarm();
   await saveAutoState();
-  await syncActionIcon(false).catch(() => {});
+  lastActionIndicatorKey = '';
+  await syncActionIndicator().catch(() => {});
   return autoState;
 };
 
@@ -1477,7 +1583,6 @@ const finalizeStandaloneCheckin = async (pending) => {
     events: Array.isArray(currentRun.events) ? currentRun.events : [],
   };
   await saveRuntimeState();
-  if (typeof chrome.action?.setBadgeText === 'function') chrome.action.setBadgeText({ text: '' }).catch(() => {});
   await showCoordinatorNotification('签到完成');
   return true;
 };
@@ -1505,6 +1610,9 @@ const recoverCompletedCheckinToQuestion = async (pending, { isAutoRun = false, s
     const originActiveTabId = await captureOriginActiveTabId();
     const questionUrl = actionPage('question');
     const existingQuestionTab = await findExistingTaskTab(questionUrl, { workflow: true });
+    const previousQuestionRecord = existingQuestionTab
+      ? getActionRecord(existingQuestionTab.id) || getAwaitingRecord(existingQuestionTab.id)
+      : null;
     const questionTab = existingQuestionTab || await createBackgroundTaskTab(questionUrl, originActiveTabId);
     const questionActionId = crypto.randomUUID();
     await createCoordinatorActionRecord({
@@ -1512,7 +1620,7 @@ const recoverCompletedCheckinToQuestion = async (pending, { isAutoRun = false, s
       action: 'question',
       actionId: questionActionId,
       workflowId: null,
-      createdByExtension: true,
+      createdByExtension: existingQuestionTab ? previousQuestionRecord?.createdByExtension === true : true,
       reusedExistingTab: Boolean(existingQuestionTab),
       originActiveTabId,
       finalizationError: inheritedFinalizationError,
@@ -1524,7 +1632,7 @@ const recoverCompletedCheckinToQuestion = async (pending, { isAutoRun = false, s
     runtimeState.run.lastError = null;
     await saveRuntimeState();
     try {
-      await retryDeliverIfNeeded(questionTab.id, { force: true });
+      await deliverToTaskTab(questionTab.id, { action: 'question', originActiveTabId, manual: false });
     } catch (error) {
       const message = error?.message || String(error) || 'question-delivery-failed';
       runtimeState.run.lastError = message;
@@ -1741,6 +1849,61 @@ const refreshLoginBlockedAction = async (tabId, action) => {
   return promise;
 };
 
+const refreshCaptchaBlockedAction = async (tabId, action) => {
+  const key = String(tabId);
+  if (captchaBlockedRefreshByTabId.has(key)) return captchaBlockedRefreshByTabId.get(key);
+
+  const promise = (async () => {
+    await loadRuntimeState();
+    const current = action || getActionRecord(tabId) || getAwaitingRecord(tabId);
+    if (!current || current.status === 'completed') return null;
+    if (!isCaptchaBlockedResult(current.lastResult)) return current;
+    const latest = getActionRecord(tabId) || getAwaitingRecord(tabId);
+    if (!latest || latest.actionId !== current.actionId) return latest || current;
+
+    const nextActionId = crypto.randomUUID();
+    const resumeMode = captchaResumeMode(current.lastResult);
+    const refreshed = {
+      ...current,
+      actionId: nextActionId,
+      status: 'pending',
+      deliveredAt: null,
+      deliveredCount: 0,
+      lastDeliveryAttemptAt: null,
+      lastDeliveryError: null,
+      lastResult: null,
+      resumeMode,
+    };
+
+    delete runtimeState.pendingActionsById[current.actionId];
+    runtimeState.pendingActionsById[nextActionId] = { ...refreshed };
+    runtimeState.actionsByTabId[key] = { ...refreshed, tabId };
+    runtimeState.awaitingContentByTabId[key] = { ...refreshed, tabId };
+    if (runtimeState.run?.currentTabId === tabId && runtimeState.run?.currentActionId === current.actionId) {
+      runtimeState.run.currentActionId = nextActionId;
+      runtimeState.run.lastError = null;
+    }
+
+    if (refreshed.workflowId) {
+      const workflow = getWorkflow(refreshed.workflowId);
+      if (workflow) {
+        if (workflow.checkinActionId === current.actionId) workflow.checkinActionId = nextActionId;
+        if (workflow.questionActionId === current.actionId) workflow.questionActionId = nextActionId;
+        workflow.stage = refreshed.action;
+        workflow.updatedAt = Date.now();
+      }
+    }
+
+    await saveRuntimeState();
+    return getActionRecord(tabId);
+  })().finally(() => {
+    if (captchaBlockedRefreshByTabId.get(key) === promise) captchaBlockedRefreshByTabId.delete(key);
+  });
+
+  captchaBlockedRefreshByTabId.set(key, promise);
+  return promise;
+};
+
 const claimPendingActionForTab = async (tabId, page) => {
   await loadRuntimeState();
   const pending = Object.values(runtimeState.pendingActionsById).find((record) => record?.status === 'pending' && record?.action && isTargetUrl(page, actionPage(record.action)));
@@ -1764,8 +1927,15 @@ const createCoordinatorActionRecord = async ({
   finalizationError = null,
   finalizationAttemptAt = null,
   finalizationCompletedAt = null,
+  reloadAttempted,
 }) => {
   await loadRuntimeState();
+  const previousAction = getActionRecord(tabId);
+  const previousAwaiting = getAwaitingRecord(tabId);
+  const inheritedReloadAttempted = previousAction?.reloadAttempted === true || previousAwaiting?.reloadAttempted === true;
+  const nextReloadAttempted = reloadAttempted === true || reloadAttempted === false
+    ? reloadAttempted
+    : inheritedReloadAttempted;
   const record = {
     action,
     actionId,
@@ -1781,6 +1951,7 @@ const createCoordinatorActionRecord = async ({
     lastResult: null,
     createdByExtension,
     reusedExistingTab,
+    reloadAttempted: nextReloadAttempted,
     finalizationPending,
     closeStatus,
     closeSkippedReason,
@@ -1844,7 +2015,7 @@ const ensureQuestionWorkflowTab = async (workflowId) => {
     workflow.questionActionId = existing.actionId || workflow.questionActionId;
     workflow.updatedAt = Date.now();
     await saveRuntimeState();
-    await retryDeliverIfNeeded(existing.tabId, { force: true }).catch(() => {});
+    await deliverToTaskTab(existing.tabId, { action: 'question', originActiveTabId: existing.originActiveTabId }).catch(() => {});
     return existing.tabId;
   }
 
@@ -1924,7 +2095,10 @@ const promoteCheckinTabToQuestion = async (pending) => {
   workflow.tabIds = Array.from(new Set([...(workflow.tabIds || []), pending.tabId]));
   workflow.updatedAt = Date.now();
   await saveRuntimeState();
-  await retryDeliverIfNeeded(pending.tabId, { force: true }).catch(() => {});
+  await deliverToTaskTab(pending.tabId, {
+    action: 'question',
+    originActiveTabId: current.originActiveTabId,
+  }).catch(() => {});
   return pending.tabId;
 };
 
@@ -1993,7 +2167,10 @@ const finalizeCompletedSuccess = async (pending) => {
           }
           await saveRuntimeState();
         }
-        await retryDeliverIfNeeded(nextQuestionTabId, { force: true }).catch(() => {});
+        await deliverToTaskTab(nextQuestionTabId, {
+          action: 'question',
+          originActiveTabId: pending.originActiveTabId,
+        }).catch(() => {});
       }
     } catch (error) {
       await loadRuntimeState();
@@ -2070,6 +2247,7 @@ const deliverAction = async (tabId) => {
     runtimeState.actionsByTabId[String(tabId)] = updated;
     delete runtimeState.awaitingContentByTabId[String(tabId)];
     await saveRuntimeState();
+    await clearReuseReloadTimeout(tabId);
     return true;
   } catch (error) {
     updated.lastDeliveryError = error?.message || 'sendMessage-failed';
@@ -2088,6 +2266,7 @@ const retryDeliverIfNeeded = async (tabId, { force = false, pageState = null, ma
     if (tab?.url) action = await claimPendingActionForTab(tabId, tab.url);
   }
   if (!action || action.status === 'completed') return false;
+  if (isCaptchaBlockedResult(action.lastResult)) return false;
   const loginBlocked = action.lastResult?.status === 'login-blocked' || action.lastResult?.reason === 'requires-login';
   if (loginBlocked && !force && (pageState == null || pageState === 'requires-login')) return false;
   if (loginBlocked && (force || (pageState && pageState !== 'requires-login'))) {
@@ -2104,6 +2283,205 @@ const retryDeliverIfNeeded = async (tabId, { force = false, pageState = null, ma
     await saveRuntimeState();
   }
   return deliverAction(tabId);
+};
+
+const pauseForUnavailableContent = async (reason = 'content-script-unavailable') => {
+  await loadRuntimeState();
+  runtimeState.run.status = 'paused';
+  runtimeState.run.lastError = reason;
+  await saveRuntimeState();
+};
+
+const reuseReloadAlarmName = (tabId) => `${REUSE_RELOAD_ALARM_PREFIX}${tabId}`;
+const reuseReloadTimers = new Map();
+
+const shouldRecoverFailedReuse = (record) => {
+  if (!isReusedUserRecoveryTarget(record)) return false;
+  if (record?.status === 'completed') return false;
+  if (isReuseDeliverySuccessful(record)) return false;
+  return true;
+};
+
+const fireReuseReloadTimeout = async (tabId, source = 'reuse-reload-timeout') => {
+  await loadRuntimeState();
+  const run = getRunState();
+  if (run.currentTabId !== tabId) return;
+  const record = getActionRecord(tabId) || getAwaitingRecord(tabId);
+  if (!shouldRecoverFailedReuse(record)) return;
+  await abandonReusedTabAndCreate({
+    action: record?.action || (run.stage === 'question' ? 'question' : 'checkin'),
+    originActiveTabId: record?.originActiveTabId ?? run.originActiveTabId,
+    source,
+  });
+};
+
+const scheduleReuseReloadTimeout = async (tabId) => {
+  if (!Number.isInteger(tabId)) return false;
+  const existingTimer = reuseReloadTimers.get(tabId);
+  if (existingTimer && typeof clearTimeout === 'function') clearTimeout(existingTimer);
+  if (typeof setTimeout === 'function') {
+    reuseReloadTimers.set(tabId, setTimeout(() => {
+      reuseReloadTimers.delete(tabId);
+      coordinatorQueue(() => fireReuseReloadTimeout(tabId, 'reuse-reload-timeout-timer')).catch((error) => setRunError(error, 'reuse-reload-timeout-timer-failed'));
+    }, REUSE_RELOAD_TIMEOUT_MS));
+  }
+  if (typeof chrome.alarms?.create === 'function') {
+    await chrome.alarms.create(reuseReloadAlarmName(tabId), { when: Date.now() + REUSE_RELOAD_TIMEOUT_MS });
+  }
+  return true;
+};
+
+const clearReuseReloadTimeout = async (tabId) => {
+  if (!Number.isInteger(tabId)) return false;
+  const existingTimer = reuseReloadTimers.get(tabId);
+  if (existingTimer && typeof clearTimeout === 'function') {
+    clearTimeout(existingTimer);
+    reuseReloadTimers.delete(tabId);
+  }
+  if (typeof chrome.alarms?.clear !== 'function') return true;
+  return Boolean(await chrome.alarms.clear(reuseReloadAlarmName(tabId)).catch(() => false));
+};
+
+const isReusedUserRecoveryTarget = (record) => record?.reusedExistingTab === true || record?.createdByExtension === false;
+
+const isReuseDeliverySuccessful = (record) => Boolean(record?.deliveredAt) && !record?.lastDeliveryError;
+
+const abandonReusedTabAndCreate = async ({ action, originActiveTabId = null, source = 'reuse-delivery-failed' } = {}) => {
+  await loadRuntimeState();
+  await clearReuseReloadTimeout(runtimeState.run.currentTabId);
+  const nextAction = isCoordinatorAction(action) ? action : (runtimeState.run.stage === 'question' ? 'question' : 'checkin');
+  const actionId = crypto.randomUUID();
+  runtimeState.run.currentActionId = actionId;
+  runtimeState.run.currentTabId = null;
+  runtimeState.run.stage = nextAction;
+  runtimeState.run.transition = 'opening';
+  runtimeState.run.lastError = null;
+  runtimeState.run.status = 'running';
+  await saveRuntimeState();
+  try {
+    const tab = await createBackgroundTaskTab(actionPage(nextAction), runtimeState.run.originActiveTabId ?? originActiveTabId);
+    await createCoordinatorActionRecord({
+      tabId: tab.id,
+      action: nextAction,
+      actionId,
+      createdByExtension: true,
+      reusedExistingTab: false,
+      originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId,
+    });
+    await pushRunEvent('tab-created', { tabId: tab.id, action: nextAction, actionId, source, at: Date.now() }).catch(() => {});
+    return { ok: true, tab, created: true };
+  } catch (error) {
+    await pauseForUnavailableContent('content-script-unavailable');
+    await pushRunEvent('reuse-fallback-create-failed', { error: error?.message || String(error), source }).catch(() => {});
+    return { ok: false, tab: null, created: false };
+  }
+};
+
+const recoverFailedReuseDelivery = async (tabId, { action, originActiveTabId = null } = {}) => {
+  await loadRuntimeState();
+  const record = getActionRecord(tabId) || getAwaitingRecord(tabId);
+  const nextAction = action || record?.action;
+  const isReusedUserTab = isReusedUserRecoveryTarget(record);
+  if (record && !isReusedUserTab) {
+    return { ok: true, tab: { id: tabId }, awaiting: true };
+  }
+  if (!record) return abandonReusedTabAndCreate({ action: nextAction, originActiveTabId });
+  if (record.reloadAttempted === true) return abandonReusedTabAndCreate({ action: nextAction, originActiveTabId });
+  const next = { ...record, reloadAttempted: true, lastDeliveryError: record.lastDeliveryError || 'sendMessage-failed' };
+  runtimeState.actionsByTabId[String(tabId)] = next;
+  if (runtimeState.awaitingContentByTabId[String(tabId)]) {
+    runtimeState.awaitingContentByTabId[String(tabId)] = { ...runtimeState.awaitingContentByTabId[String(tabId)], reloadAttempted: true, lastDeliveryError: next.lastDeliveryError };
+  }
+  if (runtimeState.pendingActionsById[next.actionId]) {
+    runtimeState.pendingActionsById[next.actionId] = { ...runtimeState.pendingActionsById[next.actionId], reloadAttempted: true };
+  }
+  await saveRuntimeState();
+  if (typeof chrome.tabs?.reload === 'function') {
+    try {
+      await chrome.tabs.reload(tabId);
+      await scheduleReuseReloadTimeout(tabId);
+      await pushRunEvent('tab-reload', { tabId, action: record.action, actionId: record.actionId, at: Date.now() }).catch(() => {});
+      return { ok: true, tab: { id: tabId }, reloaded: true };
+    } catch (error) {
+      await pushRunEvent('tab-reload-failed', { tabId, error: error?.message || String(error) }).catch(() => {});
+    }
+  }
+  return abandonReusedTabAndCreate({ action: nextAction, originActiveTabId });
+};
+
+const deliverToTaskTab = async (tabId, { action, originActiveTabId = null, manual = false } = {}) => {
+  const delivered = await retryDeliverIfNeeded(tabId, { force: true, manual }).catch((error) => {
+    setRunError(error, 'deliver-reused-failed');
+    return false;
+  });
+  if (delivered) return { ok: true, tab: { id: tabId }, delivered: true };
+  return recoverFailedReuseDelivery(tabId, { action, originActiveTabId });
+};
+
+const startQuestionStageForEverything = async ({ originActiveTabId = null, manual = false } = {}) => {
+  await loadRuntimeState();
+  const incomingStage = runtimeState.run.stage;
+  const incomingTabId = runtimeState.run.currentTabId;
+  const incomingActionId = runtimeState.run.currentActionId;
+  runtimeState.run.mode = 'everything';
+  runtimeState.run.stage = 'question';
+  runtimeState.run.status = 'running';
+  runtimeState.run.transition = 'reconcile';
+  runtimeState.run.lastError = null;
+  await saveRuntimeState();
+  const questionPage = actionPage('question');
+  const existingQuestion = await findExistingTaskTab(questionPage, { workflow: true });
+  if (existingQuestion?.id != null) {
+    const previousRecord = getActionRecord(existingQuestion.id) || getAwaitingRecord(existingQuestion.id);
+    const canReuseActionId = incomingStage === 'question'
+      && incomingTabId === existingQuestion.id
+      && typeof incomingActionId === 'string'
+      && incomingActionId.length > 0;
+    const actionId = canReuseActionId ? incomingActionId : crypto.randomUUID();
+    const createdByExtension = previousRecord?.createdByExtension === true;
+    const reusedExistingTab = !(createdByExtension && previousRecord?.reusedExistingTab !== true);
+    const alreadyDelivered = Boolean(
+      previousRecord
+      && previousRecord.actionId === actionId
+      && Number.isFinite(previousRecord.deliveredAt)
+      && !previousRecord.lastDeliveryError
+    );
+    if (alreadyDelivered) {
+      runtimeState.run.currentTabId = existingQuestion.id;
+      runtimeState.run.currentActionId = actionId;
+      await saveRuntimeState();
+      return { tab: { id: existingQuestion.id }, run: runtimeState.run };
+    }
+    await createCoordinatorActionRecord({
+      tabId: existingQuestion.id,
+      action: 'question',
+      actionId,
+      createdByExtension,
+      reusedExistingTab,
+      originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId,
+    });
+    const recovered = await deliverToTaskTab(existingQuestion.id, {
+      action: 'question',
+      originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId,
+      manual,
+    });
+    return { tab: recovered.tab || { id: existingQuestion.id }, run: runtimeState.run };
+  }
+  const actionId = crypto.randomUUID();
+  runtimeState.run.currentActionId = actionId;
+  runtimeState.run.currentTabId = null;
+  runtimeState.run.transition = 'opening';
+  await saveRuntimeState();
+  const tab = await createBackgroundTaskTab(questionPage, runtimeState.run.originActiveTabId ?? originActiveTabId);
+  await createCoordinatorActionRecord({
+    tabId: tab.id,
+    action: 'question',
+    actionId,
+    createdByExtension: true,
+    reusedExistingTab: false,
+    originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId,
+  });
+  return { tab, run: runtimeState.run };
 };
 
 const openActionPage = async (action, workflowId = null) => {
@@ -2131,8 +2509,30 @@ const openActionPage = async (action, workflowId = null) => {
     await saveRuntimeState();
     throw error;
   }
-  await retryDeliverIfNeeded(target.id);
+  await deliverToTaskTab(target.id, { action, originActiveTabId });
   return target;
+};
+
+const shouldSkipCheckinForEverything = async () => {
+  let activeTab = null;
+  if (typeof chrome.tabs?.query === 'function') {
+    const candidates = [
+      { active: true, currentWindow: true },
+      { active: true, lastFocusedWindow: true },
+      { active: true },
+    ];
+    for (const queryInfo of candidates) {
+      const tabs = await chrome.tabs.query(queryInfo).catch(() => []);
+      const match = Array.isArray(tabs) ? tabs.find((tab) => tab?.active === true) : null;
+      if (match) {
+        activeTab = match;
+        break;
+      }
+    }
+  }
+  if (isTargetUrl(activeTab?.url, ExtensionProtocol.PAGE_URLS.dailyQuestion)) return true;
+  if (isTargetUrl(activeTab?.url, ExtensionProtocol.PAGE_URLS.dailyCheckin)) return false;
+  return runtimeState.dailyStatus?.checkin?.completed === true;
 };
 
 const coordinatorStart = async ({ action, source, manual = false, now = new Date() } = {}) => coordinatorQueue(async () => {
@@ -2190,6 +2590,9 @@ const coordinatorStart = async ({ action, source, manual = false, now = new Date
     runtimeState.run.originActiveTabId = originActiveTabId;
     await saveRuntimeState();
   }
+  if (requestedMode === 'everything' && await shouldSkipCheckinForEverything()) {
+    return startQuestionStageForEverything({ originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId, manual });
+  }
   const page = actionPage(effectiveAction);
   const current = Number.isInteger(runtimeState.run.currentTabId) ? await chrome.tabs.get(runtimeState.run.currentTabId).catch(() => null) : null;
   const currentRecord = Number.isInteger(runtimeState.run.currentTabId)
@@ -2233,10 +2636,10 @@ const coordinatorStart = async ({ action, source, manual = false, now = new Date
     if (!runtimeState.run.currentActionId) runtimeState.run.currentActionId = actionId;
     await saveRuntimeState();
     if (!getActionRecord(current.id) && !getAwaitingRecord(current.id)) {
-      await createCoordinatorActionRecord({ tabId: current.id, action: effectiveAction, actionId, createdByExtension: true, reusedExistingTab: true, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId });
+      await createCoordinatorActionRecord({ tabId: current.id, action: effectiveAction, actionId, createdByExtension: false, reusedExistingTab: true, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId });
     }
-    await retryDeliverIfNeeded(current.id, { force: true, manual }).catch((error) => setRunError(error, 'deliver-current-failed'));
-    return { tab: { id: current.id }, run: runtimeState.run };
+    const recoveredCurrent = await deliverToTaskTab(current.id, { action: effectiveAction, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId, manual });
+    return { tab: recoveredCurrent.tab || { id: current.id }, run: runtimeState.run };
   }
   if (Number.isInteger(current?.id) && runtimeState.run.stage === 'question' && isTargetUrl(current.url, ExtensionProtocol.PAGE_URLS.dailyCheckin)) {
     const actionId = runtimeState.run.currentActionId || crypto.randomUUID();
@@ -2247,10 +2650,10 @@ const coordinatorStart = async ({ action, source, manual = false, now = new Date
     const updateChange = current.active === true ? { url: page } : { url: page, active: false };
     await chrome.tabs.update(current.id, updateChange);
     if (!getActionRecord(current.id) && !getAwaitingRecord(current.id)) {
-      await createCoordinatorActionRecord({ tabId: current.id, action: effectiveAction, actionId, createdByExtension: true, reusedExistingTab: true, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId });
+      await createCoordinatorActionRecord({ tabId: current.id, action: effectiveAction, actionId, createdByExtension: false, reusedExistingTab: true, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId });
     }
-    await retryDeliverIfNeeded(current.id, { force: true, manual }).catch((error) => setRunError(error, 'deliver-current-failed'));
-    return { tab: { id: current.id }, run: runtimeState.run };
+    const recoveredPromoted = await deliverToTaskTab(current.id, { action: effectiveAction, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId, manual });
+    return { tab: recoveredPromoted.tab || { id: current.id }, run: runtimeState.run };
   }
   const existing = await findExistingTaskTab(page, { workflow: requestedMode === 'everything' });
   if (existing?.id != null) {
@@ -2269,8 +2672,8 @@ const coordinatorStart = async ({ action, source, manual = false, now = new Date
     if (Number.isInteger(originActiveTabId) && !Number.isInteger(runtimeState.run.originActiveTabId)) runtimeState.run.originActiveTabId = originActiveTabId;
     await saveRuntimeState();
     await createCoordinatorActionRecord({ tabId: existing.id, action: effectiveAction, actionId, createdByExtension, reusedExistingTab, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId });
-    await retryDeliverIfNeeded(existing.id, { force: true, manual }).catch((error) => setRunError(error, 'deliver-reused-failed'));
-    return { tab: { id: existing.id }, run: runtimeState.run };
+    const recoveredExisting = await deliverToTaskTab(existing.id, { action: effectiveAction, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId, manual });
+    return { tab: recoveredExisting.tab || { id: existing.id }, run: runtimeState.run };
   }
   const actionId = crypto.randomUUID();
   runtimeState.run.currentActionId = actionId;
@@ -2293,6 +2696,17 @@ const coordinatorContentReady = async ({ tabId, pageState } = {}) => coordinator
   const record = getActionRecord(tabId) || getAwaitingRecord(tabId);
   if (!run.runId || run.currentTabId !== tabId || !record || run.currentActionId !== record.actionId) return { ok: true, accepted: false, ignored: true };
   await pushRunEvent('content-ready', { tabId, pageState });
+  if (isCaptchaBlockedResult(record.lastResult) && pageState === 'active') {
+    const refreshed = await refreshCaptchaBlockedAction(tabId, record);
+    if (refreshed && refreshed.actionId !== record.actionId) {
+      runtimeState.run.currentActionId = refreshed.actionId;
+      runtimeState.run.currentTabId = tabId;
+      runtimeState.run.lastError = null;
+      await saveRuntimeState();
+      await deliverAction(tabId);
+      return { ok: true, refreshed: true };
+    }
+  }
   const loginBlocked = record.lastResult?.status === 'login-blocked' || record.lastResult?.reason === 'requires-login';
   if (loginBlocked && pageState !== 'requires-login') {
     const refreshed = await refreshLoginBlockedAction(tabId, record);
@@ -2317,6 +2731,7 @@ const coordinatorContentReady = async ({ tabId, pageState } = {}) => coordinator
       runtimeState.actionsByTabId[String(tabId)] = next;
       runtimeState.awaitingContentByTabId[String(tabId)] = next;
       await saveRuntimeState();
+      await clearReuseReloadTimeout(tabId);
     } else {
       const next = {
         ...record,
@@ -2327,6 +2742,12 @@ const coordinatorContentReady = async ({ tabId, pageState } = {}) => coordinator
       runtimeState.awaitingContentByTabId[String(tabId)] = next;
       runtimeState.run.lastError = next.lastDeliveryError;
       await saveRuntimeState();
+      if (pageState !== 'updated' && (record.reusedExistingTab === true || record.createdByExtension === false)) {
+        await recoverFailedReuseDelivery(tabId, {
+          action: record.action,
+          originActiveTabId: record.originActiveTabId ?? runtimeState.run.originActiveTabId,
+        });
+      }
     }
   }
   return { ok: true };
@@ -2447,10 +2868,6 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
         }
       }).catch(() => {});
     }
-    if (typeof chrome.action?.setBadgeText === 'function') {
-      chrome.action.setBadgeText({ text: '!' }).catch(() => {});
-      chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' }).catch(() => {});
-    }
     const alertMsg = (reason === 'requires-login' || status === 'login-blocked')
       ? '一亩三分地账号需要登录，已为您打开页面'
       : (reason === 'captcha-required' || reason === 'captcha-error' || status === 'captcha-required')
@@ -2476,6 +2893,17 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
         }
       }
     }
+    if (isCaptchaBlockedResult({ status, reason }) && result?.pageState === 'active') {
+      const latest = getActionRecord(tabId);
+      const refreshed = await refreshCaptchaBlockedAction(tabId, latest);
+      if (refreshed && refreshed.actionId !== latest?.actionId) {
+        runtimeState.run.currentActionId = refreshed.actionId;
+        runtimeState.run.lastError = null;
+        await saveRuntimeState();
+        await deliverAction(tabId);
+        return { ok: true, accepted: true, retained: true, refreshed: true };
+      }
+    }
     return { ok: true, accepted: true, retained: true };
   }
   runtimeState.run.status = 'paused';
@@ -2489,10 +2917,6 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
         chrome.windows.update(t.windowId, { focused: true }).catch(() => {});
       }
     }).catch(() => {});
-  }
-  if (typeof chrome.action?.setBadgeText === 'function') {
-    chrome.action.setBadgeText({ text: '!' }).catch(() => {});
-    chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' }).catch(() => {});
   }
   if (autoRun) {
     await loadAutoState();
@@ -2571,6 +2995,9 @@ const coordinatorFinalize = async (finalize = null) => coordinatorQueue(async ()
             // transition. Another CONTENT_READY/recovery event may already
             // have created the question page while this worker was yielding.
             const existingQuestionTab = await findExistingTaskTab(questionUrl, { workflow: true });
+            const previousQuestionRecord = existingQuestionTab
+              ? getActionRecord(existingQuestionTab.id) || getAwaitingRecord(existingQuestionTab.id)
+              : null;
             const questionTab = existingQuestionTab || await createBackgroundTaskTab(questionUrl, originActiveTabId);
             const questionActionId = crypto.randomUUID();
             await createCoordinatorActionRecord({
@@ -2578,7 +3005,7 @@ const coordinatorFinalize = async (finalize = null) => coordinatorQueue(async ()
               action: 'question',
               actionId: questionActionId,
               workflowId: null,
-              createdByExtension: true,
+              createdByExtension: existingQuestionTab ? previousQuestionRecord?.createdByExtension === true : true,
               reusedExistingTab: Boolean(existingQuestionTab),
               originActiveTabId,
               finalizationError: inheritedFinalizationError,
@@ -2589,7 +3016,7 @@ const coordinatorFinalize = async (finalize = null) => coordinatorQueue(async ()
             runtimeState.run.currentActionId = questionActionId;
             await saveRuntimeState();
             try {
-              await retryDeliverIfNeeded(questionTab.id, { force: true });
+              await deliverToTaskTab(questionTab.id, { action: 'question', originActiveTabId, manual: false });
             } catch (error) {
               const message = error?.message || String(error) || 'question-delivery-failed';
               runtimeState.run.lastError = message;
@@ -2665,7 +3092,10 @@ const coordinatorFinalize = async (finalize = null) => coordinatorQueue(async ()
             runtimeState.run.currentTabId = recovered.tabId;
             runtimeState.run.currentActionId = nextActionId;
             await saveRuntimeState();
-            await retryDeliverIfNeeded(recovered.tabId, { force: true }).catch(() => {});
+            await deliverToTaskTab(recovered.tabId, {
+              action: 'question',
+              originActiveTabId: pending.originActiveTabId ?? runtimeState.run.originActiveTabId ?? null,
+            }).catch(() => {});
             return { ok: true, completed: true };
           }
         }
@@ -2712,9 +3142,6 @@ const coordinatorFinalize = async (finalize = null) => coordinatorQueue(async ()
       await clearLegacyTaskState();
       runtimeState.run = { ...defaultRuntimeState().run, status: 'idle', events: run.events };
       await saveRuntimeState();
-      if (typeof chrome.action?.setBadgeText === 'function') {
-        chrome.action.setBadgeText({ text: '' }).catch(() => {});
-      }
       await showCoordinatorNotification((finalize.mode || inferRunMode(run, pending)) === 'question' ? '答题完成' : '签到和答题完成');
       return { ok: true, completed: true };
     }
@@ -2795,10 +3222,16 @@ const reconcileCoordinator = async ({ now = new Date(), source = 'startup' } = {
     runtimeState.workflowsById = {};
     runtimeState.activeWorkflowId = null;
     await saveRuntimeState();
+    for (const tabId of [...reuseReloadTimers.keys()]) {
+      await clearReuseReloadTimeout(tabId);
+    }
     if (typeof chrome.alarms?.getAll === 'function' && typeof chrome.alarms?.clear === 'function') {
       const alarms = await chrome.alarms.getAll().catch(() => []);
       for (const alarm of Array.isArray(alarms) ? alarms : []) {
-        if (typeof alarm?.name === 'string' && alarm.name.startsWith(RUNTIME_FINALIZE_ALARM_PREFIX)) {
+        if (typeof alarm?.name === 'string' && (
+          alarm.name.startsWith(RUNTIME_FINALIZE_ALARM_PREFIX)
+          || alarm.name.startsWith(REUSE_RELOAD_ALARM_PREFIX)
+        )) {
           await chrome.alarms.clear(alarm.name).catch(() => {});
         }
       }
@@ -2821,7 +3254,16 @@ const reconcileCoordinator = async ({ now = new Date(), source = 'startup' } = {
     return { ok: true, run: runtimeState.run, source };
   }
   if (Number.isInteger(current?.id) && record && run.currentActionId === record.actionId) {
-    await retryDeliverIfNeeded(currentTabId, { force: true }).catch((error) => setRunError(error, 'reconcile-deliver-failed'));
+    const delivered = await retryDeliverIfNeeded(currentTabId, { force: true }).catch((error) => {
+      setRunError(error, 'reconcile-deliver-failed');
+      return false;
+    });
+    if (!delivered && shouldRecoverFailedReuse(record)) {
+      await recoverFailedReuseDelivery(currentTabId, {
+        action: record.action,
+        originActiveTabId: record.originActiveTabId ?? runtimeState.run.originActiveTabId,
+      });
+    }
     return { ok: true, run: runtimeState.run, source };
   }
   const page = actionPage(run.stage || 'checkin');
@@ -2837,6 +3279,10 @@ const reconcileCoordinator = async ({ now = new Date(), source = 'startup' } = {
     if (!getActionRecord(reusable.id) && !getAwaitingRecord(reusable.id)) {
       await createCoordinatorActionRecord({ tabId: reusable.id, action: runtimeState.run.stage, actionId, createdByExtension: false, reusedExistingTab: true, originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId });
     }
+    await deliverToTaskTab(reusable.id, {
+      action: runtimeState.run.stage,
+      originActiveTabId: runtimeState.run.originActiveTabId ?? originActiveTabId,
+    });
     return { ok: true, run: runtimeState.run, source };
   }
   const actionId = run.currentActionId || crypto.randomUUID();
@@ -3068,6 +3514,15 @@ chrome.runtime?.onInstalled?.addListener(() => {
 chrome.storage?.onChanged?.addListener(() => {});
 
 chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (typeof alarm?.name === 'string' && alarm.name.startsWith(REUSE_RELOAD_ALARM_PREFIX)) {
+    coordinatorQueue(async () => {
+      const rawTabId = alarm.name.slice(REUSE_RELOAD_ALARM_PREFIX.length);
+      const tabId = Number(rawTabId);
+      if (!Number.isInteger(tabId) || String(tabId) !== rawTabId) return;
+      await fireReuseReloadTimeout(tabId, 'reuse-reload-timeout');
+    }).catch((error) => setRunError(error, 'reuse-reload-timeout-failed'));
+    return;
+  }
   if (typeof alarm?.name === 'string' && alarm.name.startsWith(RUNTIME_FINALIZE_ALARM_PREFIX)) {
     coordinatorQueue(async () => {
       await loadRuntimeState();

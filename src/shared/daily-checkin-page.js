@@ -66,6 +66,22 @@
     const nodes = Array.from(root.querySelectorAll?.('button,input,label,[role="button"],[role="radio"]') || []);
     return nodes.find(semanticDefault) || null;
   }
+  function isDefaultSelected(node = findDefault()) {
+    if (!node) return false;
+    if (node.checked === true) return true;
+    if (node.getAttribute?.('aria-checked') === 'true') return true;
+    if (node.getAttribute?.('aria-selected') === 'true') return true;
+    if (node.getAttribute?.('aria-pressed') === 'true') return true;
+    if (node.getAttribute?.('data-selected') === 'true') return true;
+    if (node.getAttribute?.('data-active') === 'true') return true;
+    const state = String(node.getAttribute?.('data-state') || '').toLowerCase();
+    if (state === 'selected' || state === 'checked' || state === 'on') return true;
+    const classes = String(node.className?.baseVal || node.className || '');
+    if (/(?:^|\s)(?:bg-primary|ring-primary|border-primary)(?:\s|$)/.test(classes)) return true;
+    if (node.querySelector?.('input')?.checked === true) return true;
+    if (node.closest?.('label')?.querySelector?.('input')?.checked === true) return true;
+    return false;
+  }
   function findSubmit(root = global.document) {
     const ACTION = /^(?:签到|立即签到|确认签到|提交签到|check\s*in|sign\s*in)$/i;
     return Array.from(root.querySelectorAll?.('button,input[type="submit"],input[type="button"],[role="button"]') || []).find((n) => {
@@ -85,5 +101,5 @@
     if (hasCompletedControl(root, scope) || hasExplicitCompletionText(scopedBody) || hasExplicitCompletionText(documentBody)) return 'completed';
     return 'active';
   }
-  global.DailyCheckinPage = Object.freeze({ TOOLBAR_ID, text, isCheckinPage, findDefault, findSubmit, getState });
+  global.DailyCheckinPage = Object.freeze({ TOOLBAR_ID, text, isCheckinPage, findDefault, isDefaultSelected, findSubmit, getState });
 })(globalThis);

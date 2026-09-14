@@ -7,7 +7,7 @@ const make = (html, url = 'https://www.1point3acres.com/next/daily-checkin') => 
   const nodes = [];
   const parse = (tag, attrs, body) => {
     const map = Object.fromEntries([...attrs.matchAll(/([\w-]+)(?:="([^"]*)")?/g)].map((m) => [m[1], m[2] ?? '']));
-    const n = { textContent: body, hidden: false, disabled: Object.prototype.hasOwnProperty.call(map, 'disabled'), ownerDocument: null, attributes: map, getAttribute(k) { return this.attributes[k] ?? null; }, matches() { return false; }, closest() { return null; } };
+    const n = { textContent: body, hidden: false, disabled: Object.prototype.hasOwnProperty.call(map, 'disabled'), checked: Object.prototype.hasOwnProperty.call(map, 'checked'), className: map.class || '', ownerDocument: null, attributes: map, getAttribute(k) { return this.attributes[k] ?? null; }, querySelector() { return null; }, matches() { return false; }, closest() { return null; } };
     nodes.push(n); return n;
   };
   const body = { textContent: html.replace(/<[^>]+>/g, ' '), innerText: html.replace(/<[^>]+>/g, ' ') };
@@ -36,4 +36,40 @@ x = make('<button>心情很好</button><textarea></textarea>'); assert.equal(x.a
 x = make('<button class="hover:bg-primary-light rounded-md border hover:cursor-pointer">X 没心情</button>'); assert(x.api.findDefault(x.document));
 x = make('<button class="hover:bg-primary-light rounded-md border hover:cursor-pointer">其他心情</button>'); assert.equal(x.api.findDefault(x.document), null);
 x = make('<input name="qdxq" value="x"></input>'); assert(x.api.findDefault(x.document));
+x = make('<button aria-checked="true">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), true, 'aria-checked default mood must count as selected');
+x = make('<button>没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), false, 'unselected default mood must not count as selected');
+x = make('<button aria-pressed="true">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), true, 'aria-pressed default mood must count as selected');
+x = make('<button data-state="selected">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), true, 'data-state=selected must count as selected');
+x = make('<button data-state="CHECKED">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), true, 'data-state must match selected|checked|on case-insensitively');
+x = make('<button data-state="on">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), true, 'data-state=on must count as selected');
+x = make('<button data-active="true">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), true, 'data-active=true must count as selected');
+x = make('<button class="rounded-md ring-2 text-sm">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), false, 'ring-2 focus ring must not count as selected');
+x = make('<button class="rounded-md ring-primary text-sm">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), true, 'ring-primary class token must count as selected');
+x = make('<button class="rounded-md border-primary text-sm">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), true, 'border-primary class token must count as selected');
+x = make('<button class="hover:bg-primary-light rounded-md border hover:cursor-pointer">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), false, 'hover:bg-primary-light must not count as selected');
+x = make('<button class="hover:bg-primary rounded-md">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), false, 'hover:bg-primary must not count as selected');
+x = make('<button class="hover:border-primary rounded-md">没心情</button>');
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), false, 'hover:border-primary must not count as selected');
+x = make('<button>没心情</button>');
+x.api.findDefault(x.document).querySelector = (sel) => String(sel).includes('input') ? { checked: true } : null;
+assert.equal(x.api.isDefaultSelected(x.api.findDefault(x.document)), true, 'nested checked input must count as selected');
+x = make('<button>没心情</button>');
+{
+  const mood = x.api.findDefault(x.document);
+  mood.querySelector = () => null;
+  mood.closest = (sel) => String(sel).includes('label') ? { querySelector: (s) => String(s).includes('input') ? { checked: true } : null } : null;
+  assert.equal(x.api.isDefaultSelected(mood), true, 'checked input in closest label must count as selected');
+}
 console.log('daily checkin page tests passed.');

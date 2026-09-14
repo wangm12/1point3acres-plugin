@@ -9,6 +9,7 @@ const workerSource = read('../src/service-worker.js');
 const protocolSource = read('../src/shared/protocol.js');
 const questionMatcherSource = read('../src/shared/question-matcher.js');
 const learnedAnswersSource = read('../src/shared/learned-answers.js');
+const actionIndicatorSource = read('../src/shared/action-indicator.js');
 
 const getLosAngelesDateKey = (date = new Date()) => {
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -130,7 +131,10 @@ const makeHarness = ({ store, tabs = [], sendMessageMode = {}, removeMode = {}, 
   context.importScripts = (...files) => files.forEach((file) => {
     const source = file === 'shared/protocol.js' ? protocolSource
       : file === 'shared/question-matcher.js' ? questionMatcherSource
-      : learnedAnswersSource;
+      : file === 'shared/learned-answers.js' ? learnedAnswersSource
+      : file === 'shared/action-indicator.js' ? actionIndicatorSource
+      : null;
+    if (!source) throw new Error(`unknown importScripts: ${file}`);
     vm.runInContext(source, context);
   });
   vm.createContext(context);

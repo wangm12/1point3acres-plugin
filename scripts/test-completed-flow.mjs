@@ -9,6 +9,7 @@ const workerSource = read('../src/service-worker.js');
 const protocolSource = read('../src/shared/protocol.js');
 const questionMatcherSource = read('../src/shared/question-matcher.js');
 const learnedAnswersSource = read('../src/shared/learned-answers.js');
+const actionIndicatorSource = read('../src/shared/action-indicator.js');
 
 const runtimeKey = 'p3a-runtime-v1';
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -130,7 +131,12 @@ const makeHarness = ({ store, tabs = [], tabsGetMode = {}, tabsRemoveMode = {}, 
   };
   context.globalThis = context;
   context.importScripts = (...files) => files.forEach((file) => {
-    const source = file === 'shared/protocol.js' ? protocolSource : file === 'shared/question-matcher.js' ? questionMatcherSource : learnedAnswersSource;
+    const source = file === 'shared/protocol.js' ? protocolSource
+      : file === 'shared/question-matcher.js' ? questionMatcherSource
+      : file === 'shared/learned-answers.js' ? learnedAnswersSource
+      : file === 'shared/action-indicator.js' ? actionIndicatorSource
+      : null;
+    if (!source) throw new Error(`unknown importScripts: ${file}`);
     vm.runInContext(source, context);
   });
   vm.createContext(context);

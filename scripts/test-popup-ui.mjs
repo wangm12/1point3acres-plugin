@@ -14,6 +14,7 @@ const makeMockDom = () => {
     id,
     textContent: '',
     className: '',
+    attributes: Object.create(null),
     classList: {
       add(cls) { this.classes.add(cls); },
       remove(cls) { this.classes.delete(cls); },
@@ -25,6 +26,8 @@ const makeMockDom = () => {
     listeners: {},
     addEventListener(event, fn) { this.listeners[event] = fn; },
     click() { this.listeners.click?.(); },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    removeAttribute(name) { delete this.attributes[name]; },
   });
 
   const ids = [
@@ -82,6 +85,8 @@ const makeMockDom = () => {
     window: { close: () => { closedWindow = true; } },
     setTimeout: (fn) => fn(),
     clearTimeout: () => {},
+    setInterval: () => 1,
+    clearInterval: () => {},
     console,
   };
   context.globalThis = context;
@@ -115,6 +120,7 @@ const makeMockDom = () => {
 
   assert.equal(elements.get('alert-banner').hidden, false, 'alert banner should be visible when captcha required');
   assert.equal(elements.get('alert-title').textContent, '遇到验证码');
+  assert.match(elements.get('alert-desc').textContent, /Verify you are human/, 'captcha copy should tell the user to click Verify you are human');
   assert.equal(elements.get('overall-status-badge').textContent, '需人工处理');
   assert.equal(elements.get('question-task-status').textContent, '需处理');
 
@@ -134,7 +140,7 @@ const makeMockDom = () => {
   });
 
   assert.equal(elements.get('alert-banner').hidden, true, 'alert banner should be hidden when completed');
-  assert.equal(elements.get('overall-status-badge').textContent, '已全部完成');
+  assert.equal(elements.get('overall-status-badge').textContent, '已完成');
   assert.equal(elements.get('checkin-task-status').textContent, '已完成');
   assert.equal(elements.get('question-task-status').textContent, '已完成');
 
@@ -149,7 +155,7 @@ const makeMockDom = () => {
     },
   });
 
-  assert.equal(elements.get('overall-status-badge').textContent, '已全部完成');
+  assert.equal(elements.get('overall-status-badge').textContent, '已完成');
   assert.equal(elements.get('checkin-task-status').textContent, '已完成');
   assert.equal(elements.get('question-task-status').textContent, '已完成');
 
@@ -193,6 +199,8 @@ const makeMockDom = () => {
     window: { close: () => {} },
     setTimeout: (fn) => fn(),
     clearTimeout: () => {},
+    setInterval: () => 1,
+    clearInterval: () => {},
     console,
   };
   context.globalThis = context;
@@ -202,9 +210,8 @@ const makeMockDom = () => {
   vm.runInContext(popupSource, context);
 
   elements.get('run-everything').click();
-  assert.equal(sentMessages.length, 2, 'should have sent GET_RUNTIME_STATE on init + RUN_ONE_CLICK');
-  assert.equal(sentMessages[1].type, 'RUN_ONE_CLICK');
-  assert.equal(sentMessages[1].payload.action, 'everything');
+  assert.equal(sentMessages.some((message) => message.type === 'RUN_ONE_CLICK' && message.payload?.action === 'everything'), true, 'should send RUN_ONE_CLICK for everything');
+  assert.ok(sentMessages.length >= 2, 'should send runtime reads plus the one-click command');
 }
 
 console.log('Popup UI unit tests passed.');

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>隐私政策 · 一亩三分地每日助手</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #1c1917;
+        --muted: #57534e;
+        --accent: #9a3412;
+        --bg: #fff7ed;
+        --card: #fffaf5;
+        --line: #e7e5e4;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Noto Sans SC", sans-serif;
+        color: var(--ink);
+        background: var(--bg);
+        line-height: 1.65;
+      }
+      main {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 48px 20px 80px;
+      }
+      h1 { font-size: 28px; line-height: 1.25; margin: 0 0 8px; }
+      h2 { font-size: 18px; margin: 32px 0 10px; }
+      p, li { color: var(--muted); }
+      .meta { color: var(--muted); font-size: 14px; margin: 0 0 28px; }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 22px 24px;
+      }
+      ul { padding-left: 1.2em; }
+      a { color: var(--accent); }
+      footer { margin-top: 36px; font-size: 13px; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>一亩三分地每日助手 · 隐私政策</h1>
+      <p class="meta">最近更新：2026-09-09 · 本扩展是独立开发的非官方工具，与 1point3acres / 一亩三分地无关，未获官方授权。</p>
+      <div class="card">
+        <h2>收集什么</h2>
+        <ul>
+          <li>你在每日答题页确认并保存的答案。</li>
+          <li>当日签到 / 答题是否完成等进度。</li>
+          <li>若你配置了本地调度，会保存计划时间。</li>
+          <li>内容脚本会读取每日签到页、每日答题页上的题目、选项和页面状态，以便辅助操作。</li>
+        </ul>
+
+        <h2>不收集什么</h2>
+        <p>不收集账号、密码、Cookie 或浏览历史；不接入分析、广告或远程服务器；不调用站点私有接口。</p>
+
+        <h2>存在哪里、和谁共享</h2>
+        <p>上述数据只写在本机 <code>chrome.storage.local</code>。不上传、不共享、不出售。内置题库随扩展安装在本地，仅用于本机匹配。</p>
+
+        <h2>权限用途</h2>
+        <ul>
+          <li><code>storage</code>：保存本机学习答案、当日进度，以及你已配置的本地调度状态。</li>
+          <li><code>notifications</code>：签到成功或整次「一键签到 &amp; 答题」完成后发送一条桌面通知。</li>
+          <li><code>alarms</code>：在 service worker 被挂起后唤醒以收尾任务结果；仅当你已配置本地调度时用于定时，不会在未配置时自行创建任务。</li>
+          <li><code>https://1point3acres.com/*</code> 与 <code>https://www.1point3acres.com/*</code>：打开、核验并在成功后关闭签到/答题任务标签页，并仅在 <code>/next/daily-checkin</code> 与 <code>/next/daily-question</code> 注入辅助界面。</li>
+        </ul>
+
+        <h2>卸载</h2>
+        <p>从 Chrome 移除扩展后，上述本机数据会被浏览器删除。</p>
+
+        <h2>Chrome Web Store Limited Use</h2>
+        <p>The use of information received from Google APIs will adhere to the Chrome Web Store User Data Policy, including the Limited Use requirements.</p>
+      </div>
+      <footer>
+        项目主页：<a href="https://github.com/wangm12/1point3acres-plugin">github.com/wangm12/1point3acres-plugin</a>
+      </footer>
+    </main>
+  </body>
+</html>

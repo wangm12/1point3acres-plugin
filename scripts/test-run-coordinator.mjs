@@ -9,6 +9,7 @@ const workerSource = read('../src/service-worker.js');
 const protocolSource = read('../src/shared/protocol.js');
 const questionMatcherSource = read('../src/shared/question-matcher.js');
 const learnedAnswersSource = read('../src/shared/learned-answers.js');
+const actionIndicatorSource = read('../src/shared/action-indicator.js');
 
 const makeHarness = ({ session = {}, local = {}, tabs = [], removeMode = 'normal' } = {}) => {
   const events = [];
@@ -75,12 +76,22 @@ const makeHarness = ({ session = {}, local = {}, tabs = [], removeMode = 'normal
       onAlarm: { addListener: (fn) => { listeners.alarm = fn; } },
     },
     notifications: { create: async (opts) => { events.push(['notifications.create', opts]); return 'n1'; } },
-    action: { setIcon: async () => {} },
+    action: {
+      setIcon: async () => {},
+      setBadgeText: async () => {},
+      setBadgeBackgroundColor: async () => {},
+      setTitle: async () => {},
+    },
   };
   const context = { globalThis: {}, console, crypto: { randomUUID: (() => { let i = 0; return () => `uuid-${++i}`; })() }, fetch: async () => ({ ok: true, json: async () => ({ entries: [] }) }), chrome };
   context.globalThis = context;
   context.importScripts = (...files) => files.forEach((file) => {
-    const source = file === 'shared/protocol.js' ? protocolSource : file === 'shared/question-matcher.js' ? questionMatcherSource : learnedAnswersSource;
+    const source = file === 'shared/protocol.js' ? protocolSource
+      : file === 'shared/question-matcher.js' ? questionMatcherSource
+      : file === 'shared/learned-answers.js' ? learnedAnswersSource
+      : file === 'shared/action-indicator.js' ? actionIndicatorSource
+      : null;
+    if (!source) throw new Error(`unknown importScripts: ${file}`);
     vm.runInContext(source, context);
   });
   vm.createContext(context);

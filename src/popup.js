@@ -24,8 +24,8 @@
   const BLOCKED_REASONS = {
     'requires-login': { title: '需要登录', desc: '一亩三分地账号未登录，请前往网页登录' },
     'login-blocked': { title: '需要登录', desc: '一亩三分地账号未登录，请前往网页登录' },
-    'captcha-required': { title: '遇到验证码', desc: '页面出现人机验证，请前往手动完成验证' },
-    'captcha-error': { title: '验证码异常', desc: '验证码未能自动通过，请前往手动完成' },
+    'captcha-required': { title: '遇到验证码', desc: '到已打开的标签页点击 Verify you are human，完成后会自动继续' },
+    'captcha-error': { title: '验证码异常', desc: '请再点一次验证，完成后会自动继续' },
     'question-unmatched': { title: '题目未收录', desc: '当前题目未在题库中，请手动选择答案' },
     'answer-not-visible': { title: '当前选项不匹配', desc: '题库答案不在当前页面选项中，扩展未自动提交' },
     'answer-option-ambiguous': { title: '答案多候选', desc: '存在多个可能答案，请手动确认' },
@@ -40,6 +40,7 @@
     'submit-timeout': { title: '提交按钮未就绪', desc: '官网提交按钮未及时可用，请手动处理' },
     'checkin-changed-or-unavailable': { title: '签到页面已变化', desc: '签到选项或按钮已变化，请手动处理' },
     'invalid-answer-index': { title: '命中答案无效', desc: '题库命中的选项已失效，请手动选择' },
+    'content-script-unavailable': { title: '页面脚本未就绪', desc: '已打开的签到/答题页无法接收指令，请刷新页面后重试' },
   };
 
   const getCurrentActions = (runtimeState = {}) => {
@@ -138,9 +139,9 @@
       els.overallStatusBadge.className = 'badge';
       if (isCheckinDone && isQuestionDone) {
         els.overallStatusBadge.classList.add('badge-done');
-        els.overallStatusBadge.textContent = '已全部完成';
+        els.overallStatusBadge.textContent = '已完成';
         if (!state.pendingAction) {
-          setStatus('今日签到与答题已全部搞定 🎉');
+          setStatus('今天的签到和答题都做完了');
         }
       } else if (isRunning) {
         els.overallStatusBadge.classList.add('badge-running');
@@ -206,10 +207,9 @@
 
     try {
       const response = await sendRuntimeMessage(ExtensionProtocol.MESSAGE_TYPES.RUN_ONE_CLICK, { action });
-      setStatus(`已触发${label}，后台执行中…`);
-      // 成功触发后关闭弹窗，让后台静默执行
+      setStatus(`${label}进行中，可看工具栏图标状态`);
       if (response && (response.ok !== false)) {
-        setTimeout(() => { window.close(); }, 300);
+        setTimeout(() => window.close(), 300);
       }
     } catch (error) {
       setStatus(`启动失败: ${error.message}`);
