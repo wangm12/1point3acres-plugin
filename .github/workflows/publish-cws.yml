@@ -33,7 +33,7 @@ jobs:
         run: make publish
 
       - name: Upload and submit for review
-        uses: mnao305/chrome-extension-upload@v5
+        uses: mnao305/chrome-extension-upload@v7.0.0
         with:
           file-path: 'dist/1p3a-helper-*.zip'
           glob: true
