@@ -45,7 +45,7 @@
   <body>
     <main>
       <h1>一亩三分地每日助手 · 隐私政策</h1>
-      <p class="meta">最近更新：2026-09-09 · 本扩展是独立开发的非官方工具，与 1point3acres / 一亩三分地无关，未获官方授权。</p>
+      <p class="meta">最近更新：2026-10-04 · 本扩展是独立开发的非官方工具，与 1point3acres / 一亩三分地无关，未获官方授权。</p>
       <div class="card">
         <h2>收集什么</h2>
         <ul>
@@ -66,6 +66,7 @@
           <li><code>storage</code>：保存本机学习答案、当日进度，以及你已配置的本地调度状态。</li>
           <li><code>notifications</code>：签到成功或整次「一键签到 &amp; 答题」完成后发送一条桌面通知。</li>
           <li><code>alarms</code>：在 service worker 被挂起后唤醒以收尾任务结果；仅当你已配置本地调度时用于定时，不会在未配置时自行创建任务。</li>
+          <li><code>debugger</code>：官网提交按钮会拒绝脚本生成的非可信点击，因此在签到或答题条件满足时短暂连接对应任务标签页，核验域名、路径和可见提交按钮后发送浏览器鼠标点击，并立即断开连接。Chrome 的此权限具有检查和控制标签页的能力；本扩展只接受自身顶层内容脚本发来的任务提交请求，不通过调试接口读取 Cookie、账号数据或网络请求，不操作无关标签页，也不访问验证码控件。</li>
           <li><code>https://1point3acres.com/*</code> 与 <code>https://www.1point3acres.com/*</code>：打开、核验并在成功后关闭签到/答题任务标签页，并仅在 <code>/next/daily-checkin</code> 与 <code>/next/daily-question</code> 注入辅助界面。</li>
         </ul>
 
