@@ -41,6 +41,10 @@
     'checkin-changed-or-unavailable': { title: '签到页面已变化', desc: '签到选项或按钮已变化，请手动处理' },
     'invalid-answer-index': { title: '命中答案无效', desc: '题库命中的选项已失效，请手动选择' },
     'content-script-unavailable': { title: '页面脚本未就绪', desc: '已打开的签到/答题页无法接收指令，请刷新页面后重试' },
+    'task-tab-closed': { title: '任务页面已关闭', desc: '任务已暂停，请点击一键按钮重新开始' },
+    'trusted-click-permission-required': { title: '自动提交需要点击权限', desc: '请更新扩展并允许 Chrome 调试权限；也可前往页面点击官网提交按钮' },
+    'trusted-click-unavailable': { title: '浏览器点击未完成', desc: '请关闭任务页的开发者工具后重试，或前往页面点击官网提交按钮' },
+    'submit-button-stale-or-unavailable': { title: '提交按钮已变化', desc: '页面按钮已变化或被遮挡，请前往页面检查后重试' },
   };
 
   const getCurrentActions = (runtimeState = {}) => {

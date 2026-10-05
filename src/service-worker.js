@@ -113,6 +113,99 @@ const isTargetUrl = (url, page) => {
   return Boolean(actual && expected && actual.host === expected.host && actual.path === expected.path);
 };
 const isDailyTaskUrl = (url) => isTargetUrl(url, ExtensionProtocol.PAGE_URLS.dailyQuestion) || isTargetUrl(url, ExtensionProtocol.PAGE_URLS.dailyCheckin);
+const trustedSubmitTabs = new Set();
+// Serialized into the task tab only to inspect the marked, visible site button.
+// No site internals, cookies, network calls, or CAPTCHA controls are accessed.
+const getTrustedSubmitPoint = ({ action, token }) => {
+  const route = action === 'question' ? '/next/daily-question' : '/next/daily-checkin';
+  if (location.protocol !== 'https:' || !/^(?:www\.)?1point3acres\.com$/.test(location.hostname)
+      || location.pathname.replace(/\/$/, '') !== route) return null;
+  const button = document.querySelector(`[data-p3a-submit-token="${token}"]`);
+  if (!button || !button.isConnected || button.disabled || button.getAttribute('aria-disabled') === 'true'
+      || button.closest('#p3a-daily-question-helper, #p3a-daily-checkin-helper')
+      || !button.matches('button,input[type="submit"],input[type="button"],[role="button"]')) return null;
+  const label = String(button.textContent || button.value || button.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().replace(/[：:!！。.]$/g, '');
+  const allowed = action === 'question'
+    ? /^(?:提交答案|确认答案|提交|confirm\s*answer|submit)$/i
+    : /^(?:签到|立即签到|确认签到|提交签到|check\s*in|sign\s*in)$/i;
+  if (!allowed.test(label)) return null;
+  for (let node = button; node; node = node.parentElement) {
+    const style = getComputedStyle(node);
+    if (node.hidden || node.getAttribute('aria-hidden') === 'true' || style.display === 'none'
+        || /^(?:hidden|collapse)$/.test(style.visibility) || style.pointerEvents === 'none') return null;
+  }
+  const rect = button.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;
+  const hit = document.elementFromPoint(x, y);
+  return hit && button.contains(hit) ? { x, y } : null;
+};
+const clickTrustedTaskSubmit = async (payload, sender) => {
+  const { action, token } = payload || {};
+  const tabId = sender?.tab?.id;
+  if (!isCoordinatorAction(action) || !Number.isInteger(tabId) || sender.frameId !== 0
+      || sender.id !== chrome.runtime.id || !/^p3a-[a-z0-9-]{8,100}$/i.test(token || '')
+      || !isTargetUrl(sender.url, actionPage(action))) return { ok: false, error: 'invalid-submit-sender' };
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!isTargetUrl(tab?.url, actionPage(action))) return { ok: false, error: 'invalid-submit-sender' };
+  if (!chrome.debugger?.attach || !await chrome.permissions.contains({ permissions: ['debugger'] }).catch(() => false)) {
+    return { ok: false, error: 'trusted-click-permission-required' };
+  }
+  if (trustedSubmitTabs.has(tabId)) return { ok: false, error: 'trusted-click-unavailable' };
+  trustedSubmitTabs.add(tabId);
+  const target = { tabId };
+  let attached = false;
+  let focusEmulated = false;
+  let mouseDown = false;
+  let point = null;
+  try {
+    await chrome.debugger.attach(target, '1.3');
+    attached = true;
+    // Background tabs can suspend painting between scrollIntoView and input.
+    // Keep this task active without changing the user's selected tab, and
+    // read the hit target only after the scroll has reached the renderer.
+    await chrome.debugger.sendCommand(target, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+    focusEmulated = true;
+    const inspected = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+      expression: `new Promise(resolve => {
+        const timer = setTimeout(() => resolve(null), 1000);
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          clearTimeout(timer);
+          resolve((${getTrustedSubmitPoint.toString()})(${JSON.stringify({ action, token })}));
+        }));
+      })`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    point = inspected?.result?.value;
+    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+      return { ok: false, error: 'submit-button-stale-or-unavailable' };
+    }
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mouseMoved', x: point.x, y: point.y, button: 'none', buttons: 0,
+    });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mousePressed', x: point.x, y: point.y, button: 'left', buttons: 1, clickCount: 1,
+    });
+    mouseDown = true;
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mouseReleased', x: point.x, y: point.y, button: 'left', buttons: 0, clickCount: 1,
+    });
+    mouseDown = false;
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'trusted-click-unavailable' };
+  } finally {
+    if (attached && mouseDown) await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mouseReleased', x: point.x, y: point.y, button: 'left', buttons: 0, clickCount: 1,
+    }).catch(() => {});
+    if (focusEmulated) await chrome.debugger.sendCommand(target, 'Emulation.setFocusEmulationEnabled', { enabled: false }).catch(() => {});
+    if (attached) await chrome.debugger.detach(target).catch(() => {});
+    trustedSubmitTabs.delete(tabId);
+  }
+};
 const getExtensionOwnedTaskTabIds = () => {
   const ids = new Set();
   const records = runtimeState?.actionsByTabId && typeof runtimeState.actionsByTabId === 'object'
@@ -204,6 +297,7 @@ const AUTO_NON_RETRYABLE_REASONS = new Set([
   'default-option-not-found',
   'duplicate-action',
   'invalid-answer-index',
+  'task-tab-closed',
 ]);
 const AUTO_RECOVERABLE_REASONS = new Set([
   'failed',
@@ -257,6 +351,7 @@ const defaultRuntimeState = (dateKey = getLosAngelesDateKey()) => ({
     originActiveTabId: null,
     currentActionId: null,
     lastError: null,
+    attentionNotificationKeys: [],
     events: [],
   },
   diagnostics: {
@@ -289,6 +384,7 @@ const normalizeActionRecord = (record) => {
     lastDeliveryAttemptAt: Number.isFinite(record.lastDeliveryAttemptAt) ? record.lastDeliveryAttemptAt : null,
     lastDeliveryError: typeof record.lastDeliveryError === 'string' ? record.lastDeliveryError : null,
     lastResult: record.lastResult && typeof record.lastResult === 'object' ? clone(record.lastResult) : null,
+    captchaChallengeObserved: record.captchaChallengeObserved === true,
     createdByExtension: hasCreatedByExtension ? record.createdByExtension === true : null,
     reusedExistingTab: hasReusedExistingTab ? record.reusedExistingTab === true : null,
     reloadAttempted: record.reloadAttempted === true,
@@ -345,6 +441,7 @@ const normalizeRuntimeState = (state) => {
       originActiveTabId: Number.isInteger(run.originActiveTabId) ? run.originActiveTabId : null,
       currentActionId: typeof run.currentActionId === 'string' ? run.currentActionId : null,
       lastError: typeof run.lastError === 'string' ? run.lastError : null,
+      attentionNotificationKeys: Array.isArray(run.attentionNotificationKeys) ? run.attentionNotificationKeys.filter((key) => typeof key === 'string').slice(-16) : [],
       events: Array.isArray(run.events) ? run.events.slice(-30).filter((e) => e && typeof e === 'object') : [],
     };
     if (isStaleRun) {
@@ -1873,6 +1970,7 @@ const refreshCaptchaBlockedAction = async (tabId, action) => {
       lastDeliveryError: null,
       lastResult: null,
       resumeMode,
+      captchaChallengeObserved: false,
     };
 
     delete runtimeState.pendingActionsById[current.actionId];
@@ -2696,7 +2794,13 @@ const coordinatorContentReady = async ({ tabId, pageState } = {}) => coordinator
   const record = getActionRecord(tabId) || getAwaitingRecord(tabId);
   if (!run.runId || run.currentTabId !== tabId || !record || run.currentActionId !== record.actionId) return { ok: true, accepted: false, ignored: true };
   await pushRunEvent('content-ready', { tabId, pageState });
-  if (isCaptchaBlockedResult(record.lastResult) && pageState === 'active') {
+  if (isCaptchaBlockedResult(record.lastResult) && pageState === 'captcha-required') {
+    runtimeState.actionsByTabId[String(tabId)] = { ...record, captchaChallengeObserved: true };
+    await saveRuntimeState();
+    return { ok: true, retained: true };
+  }
+  if (isCaptchaBlockedResult(record.lastResult) && pageState === 'active'
+      && (record.lastResult.pageState !== 'active' || record.captchaChallengeObserved)) {
     const refreshed = await refreshCaptchaBlockedAction(tabId, record);
     if (refreshed && refreshed.actionId !== record.actionId) {
       runtimeState.run.currentActionId = refreshed.actionId;
@@ -2817,6 +2921,7 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
       ...record,
       status: (status === 'login-blocked' || reason === 'requires-login' || retainedStatuses.has(status) || retainedReasons.has(reason)) ? 'pending' : 'failed',
       lastResult: { ...result, status, reason },
+      captchaChallengeObserved: isCaptchaBlockedResult(result) && (record.captchaChallengeObserved || result?.pageState === 'captcha-required'),
       lastDeliveryError: null,
       lastDeliveryAttemptAt: Date.now(),
     };
@@ -2873,7 +2978,13 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
       : (reason === 'captcha-required' || reason === 'captcha-error' || status === 'captcha-required')
         ? '一亩三分地每日任务遇到验证码，请手动完成'
         : '一亩三分地每日任务需要人工处理，已为您打开页面';
-    await showCoordinatorNotification(alertMsg);
+    const notificationKey = `${record.action}:${isCaptchaBlockedResult({ status, reason }) ? 'captcha' : reason || status}`;
+    const notified = runtimeState.run.attentionNotificationKeys || [];
+    if (!notified.includes(notificationKey)) {
+      runtimeState.run.attentionNotificationKeys = [...notified, notificationKey].slice(-16);
+      await saveRuntimeState();
+      await showCoordinatorNotification(alertMsg);
+    }
     if (autoRun) {
       await loadAutoState();
       const failure = { ...result, status, reason };
@@ -2893,17 +3004,8 @@ const coordinatorActionResult = async ({ tabId, result, source } = {}) => coordi
         }
       }
     }
-    if (isCaptchaBlockedResult({ status, reason }) && result?.pageState === 'active') {
-      const latest = getActionRecord(tabId);
-      const refreshed = await refreshCaptchaBlockedAction(tabId, latest);
-      if (refreshed && refreshed.actionId !== latest?.actionId) {
-        runtimeState.run.currentActionId = refreshed.actionId;
-        runtimeState.run.lastError = null;
-        await saveRuntimeState();
-        await deliverAction(tabId);
-        return { ok: true, accepted: true, retained: true, refreshed: true };
-      }
-    }
+    // The same failure report cannot also prove that a challenge was solved.
+    // A later observed challenge-to-active transition may resume this action.
     return { ok: true, accepted: true, retained: true };
   }
   runtimeState.run.status = 'paused';
@@ -3182,6 +3284,25 @@ const recoverRemovedCompletedCheckin = async (tabId) => {
   return result?.completed === true || result?.transitionPending === true;
 };
 
+const pauseRemovedTaskRun = async (tabId) => coordinatorQueue(async () => {
+  await loadRuntimeState();
+  const run = getRunState();
+  if (!run.runId || run.status !== 'running' || run.currentTabId !== tabId) return false;
+  const record = getActionRecord(tabId) || getAwaitingRecord(tabId);
+  // Successful finalization intentionally closes a task tab and owns the
+  // next-stage handoff. Only an unfinished, current task is interrupted.
+  if (record?.status === 'completed' && isSuccessResult(record.lastResult)) return false;
+  await clearReuseReloadTimeout(tabId);
+  runtimeState.run.status = 'paused';
+  runtimeState.run.lastError = 'task-tab-closed';
+  await pushRunEvent('task-tab-closed', { tabId, action: record?.action || run.stage });
+  await saveRuntimeState();
+  if (run.source === 'auto') {
+    await finalizeAutoRunFailure({ pending: record, result: { status: 'failed', reason: 'task-tab-closed' } });
+  }
+  return true;
+});
+
 const reconcileCoordinator = async ({ now = new Date(), source = 'startup' } = {}) => coordinatorQueue(async () => {
   await loadRuntimeState();
   await loadAutoState().catch(() => {});
@@ -3239,6 +3360,9 @@ const reconcileCoordinator = async ({ now = new Date(), source = 'startup' } = {
   }
   await cleanupNonActiveDailyTabs(sameDay ? currentTabId : null);
   if (!sameDay) return { ok: true, run: runtimeState.run, source };
+  if (run.status === 'paused' && run.lastError === 'task-tab-closed') {
+    return { ok: true, run: runtimeState.run, source, retained: true };
+  }
   const current = currentTabId != null ? await chrome.tabs.get(currentTabId).catch(() => null) : null;
   const record = currentTabId != null ? getActionRecord(currentTabId) || getAwaitingRecord(currentTabId) : null;
   if (record?.status === 'completed' && record.finalizationPending && isSuccessResult(record.lastResult) && run.currentActionId === record.actionId && (Number.isInteger(current?.id) || record.action === 'question' || record.action === 'checkin')) {
@@ -3353,6 +3477,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || !ExtensionProtocol.isKnownType(message.type)) return false;
 
   switch (message.type) {
+    case ExtensionProtocol.MESSAGE_TYPES.CLICK_TASK_SUBMIT:
+      clickTrustedTaskSubmit(message.payload, sender).then(sendResponse)
+        .catch(() => sendResponse({ ok: false, error: 'trusted-click-unavailable' }));
+      return true;
     case ExtensionProtocol.MESSAGE_TYPES.RUN_ONE_CLICK: {
       if (!['question', 'checkin', 'everything'].includes(message.payload?.action)) { sendResponse({ ok: false, error: 'unknown-action' }); return false; }
       const opening = coordinatorStart({ action: message.payload.action, source: message.payload.action === 'everything' ? 'manual' : 'manual', manual: true });
@@ -3478,7 +3606,9 @@ chrome.tabs?.onUpdated?.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs?.onRemoved?.addListener((tabId) => {
-  recoverRemovedCompletedCheckin(tabId).catch((error) => setRunError(error, 'removed-checkin-transition-failed'));
+  return recoverRemovedCompletedCheckin(tabId)
+    .then(() => pauseRemovedTaskRun(tabId))
+    .catch((error) => setRunError(error, 'removed-task-transition-failed'));
 });
 
 chrome.runtime?.onStartup?.addListener(() => (async () => {

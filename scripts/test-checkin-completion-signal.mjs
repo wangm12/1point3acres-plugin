@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { mockTrustedSubmitTransport } from './helpers/mock-trusted-submit.mjs';
 
 const source = `${fs
   .readFileSync(new URL('../src/content.js', import.meta.url), 'utf8')
@@ -15,6 +16,7 @@ const source = `${fs
   .replace('}, 200);', '}, 1);')}
 this.__classifyCloudflareState = classifyCloudflareState;
 this.__hasPageCaptchaChallenge = hasPageCaptchaChallenge;
+this.__hasConservativeCaptchaPrompt = hasConservativeCaptchaPrompt;
 this.__detectPageState = detectPageState;
 `;
 
@@ -291,6 +293,7 @@ const buildCheckinHarness = ({ preselected = false, mutateSignatureOnClick = fal
   };
   context.window = context;
   context.globalThis = context;
+  context.trustedSubmit = mockTrustedSubmitTransport(context);
 
   vm.runInNewContext(source, context);
 
@@ -470,6 +473,7 @@ const buildQuestionHarness = ({ completionText, noiseText = '', completionToastO
   };
   context.window = context;
   context.globalThis = context;
+  context.trustedSubmit = mockTrustedSubmitTransport(context);
 
   vm.runInNewContext(source, context);
 
@@ -729,6 +733,7 @@ const buildCaptchaHarness = ({ actionId, captchaText = '请输入验证码后继
   };
   context.window = context;
   context.globalThis = context;
+  context.trustedSubmit = mockTrustedSubmitTransport(context);
   vm.runInNewContext(source, context);
   return {
     actionId,
@@ -753,6 +758,52 @@ const runCaptchaScenario = async (name, options) => {
   await waitFor(() => harness.actionResults.some((result) => result.reason === 'captcha-required'), { timeoutMs: 1200, message: `${name} captcha prompt should report captcha-required` });
   assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-required' && result.status === 'failed'), true, `${name} captcha-required must be reported as failed`);
 };
+
+for (const hide of [
+  (node) => { node.style.display = 'none'; },
+  (node) => { node.hidden = true; },
+  (node) => { node.setAttribute('aria-hidden', 'true'); },
+  (node) => { node.getBoundingClientRect = () => ({ width: 0, height: 0 }); },
+]) {
+  const harness = buildCaptchaHarness({
+    actionId: 'checkin-hidden-recaptcha-background', captchaText: '每日签到',
+    decorate: ({ body }) => {
+      // Captured live page: body > iframe, src=.../api2/aframe, display:none.
+      const iframe = makeElement('iframe');
+      iframe.setAttribute('src', 'https://www.google.com/recaptcha/api2/aframe');
+      hide(iframe);
+      body.appendChild(iframe);
+    },
+  });
+  assert.equal(harness.context.__hasPageCaptchaChallenge(harness.refs.captchaMain, 'checkin'), false, 'hidden reCAPTCHA backend frames must not block submission');
+  assert.equal(harness.context.__hasConservativeCaptchaPrompt(harness.refs.captchaMain), false, 'hidden backend frames must not trigger post-submit grace timeout');
+  await new Promise((resolve) => harness.runtimeListener(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'checkin', actionId: harness.actionId } }, {}, resolve,
+  ));
+  await waitFor(() => harness.submitClicks === 1, { message: 'hidden reCAPTCHA backend frame must allow the common submit pipeline' });
+  harness.refs.captchaMain.innerText = '签到成功';
+  await waitFor(() => harness.actionResults.some((result) => result.status === 'success'));
+  assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-required'), false);
+}
+
+{
+  const harness = buildCaptchaHarness({
+    actionId: 'checkin-hidden-challenge-ancestor', captchaText: '每日签到',
+    decorate: ({ body }) => {
+      const wrapper = makeElement('div');
+      wrapper.style.visibility = 'hidden';
+      const iframe = makeElement('iframe');
+      iframe.setAttribute('src', 'https://challenges.cloudflare.com/turnstile');
+      iframe.setAttribute('title', 'Verify you are human');
+      wrapper.appendChild(iframe);
+      const script = makeElement('script');
+      script.setAttribute('src', '/cdn-cgi/challenge-platform/scripts/jsd/main.js');
+      body.append(wrapper, script);
+    },
+  });
+  assert.equal(harness.context.__classifyCloudflareState(harness.refs.captchaMain, 'checkin'), 'none');
+  assert.equal(harness.context.__hasPageCaptchaChallenge(harness.refs.captchaMain, 'checkin'), false);
+}
 
 await runCaptchaScenario('input', {
   decorate: ({ captchaMain }) => {
@@ -959,7 +1010,8 @@ const attachTurnstile = (parent, { title = '', src = 'https://challenges.cloudfl
     captchaText: '每日签到',
     decorate: ({ captchaMain }) => { attachTurnstile(captchaMain, { title: 'Widget containing a Cloudflare security challenge' }); },
   });
-  assert.equal(widgetTitle.context.__classifyCloudflareState(widgetTitle.context.document.body, 'checkin'), 'interactive');
+  assert.equal(widgetTitle.context.__classifyCloudflareState(widgetTitle.context.document.body, 'checkin'), 'passive-turnstile');
+  assert.equal(widgetTitle.context.__hasPageCaptchaChallenge(widgetTitle.context.document.body, 'checkin'), false);
 }
 
 {
@@ -1070,6 +1122,8 @@ const attachTurnstile = (parent, { title = '', src = 'https://challenges.cloudfl
   });
   setTimeout(() => {
     targetIframe.setAttribute('title', 'Widget containing a Cloudflare security challenge');
+    harness.refs.captchaMain.innerText = '签到成功';
+    harness.refs.captchaMain.textContent = '签到成功';
   }, 8);
   const response = await new Promise((resolve) => {
     harness.runtimeListener(
@@ -1079,7 +1133,8 @@ const attachTurnstile = (parent, { title = '', src = 'https://challenges.cloudfl
     );
   });
   assertRemoteAccepted(response, 'post-submit widget title command must be accepted');
-  await waitFor(() => harness.actionResults.some((result) => result.reason === 'captcha-required' && result.resumeMode === 'join'), { timeoutMs: 1200, message: 'Cloudflare widget title after submit should join-pause' });
+  await waitFor(() => harness.actionResults.some((result) => result.status === 'success' && result.reason === 'completed'), { timeoutMs: 1200, message: 'Cloudflare widget title after submit should complete on success text' });
+  assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-required'), false, 'passive widget title must not trigger captcha-required');
 }
 
 {
@@ -1247,6 +1302,7 @@ const buildFlushHarness = ({ href, storedResults, windowName = 'p3a-test-tab' })
   };
   context.window = context;
   context.globalThis = context;
+  context.trustedSubmit = mockTrustedSubmitTransport(context);
   context.window.name = windowName;
   vm.runInNewContext(source, context);
   return { runtimeListener, actionResults, store };

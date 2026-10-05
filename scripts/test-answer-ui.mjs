@@ -12,11 +12,11 @@ assert.match(source, /if \(selected === target && \(prepared\?\.questionKey === 
 assert.match(source, /if \(!actionId\) return false/, 'content must ignore popup RUN_ONE_CLICK messages without actionId');
 assert.match(source, /signature !== lastSignature/, 'question snapshots must re-baseline when the signature changes');
 assert.doesNotMatch(source, /else if \(signature !== initialReadySignature\) \{\s*return \{ ok: false, reason: 'question-changed-or-unavailable' \}/, 'the first complete snapshot must not abort the 5s stability window');
-assert.match(source, /if \(activeRemoteActionId \|\| pendingRemoteActions\.size\)/, 'toolbar must no-op while a remote action is in flight');
+assert.match(source, /if \(localQuestionSubmitInFlight \|\| activeRemoteActionId \|\| pendingRemoteActions\.size\)/, 'toolbar must no-op while a local or remote action is in flight');
 assert.match(source, /const QUESTION_READY_TIMEOUT_MS = 5000;/, 'remote question action must give a newly opened page a bounded five-second render window');
-assert.match(source, /const lookupResponse = await bridge\.send\(ExtensionProtocol\.MESSAGE_TYPES\.LOOKUP_QUESTION/, 'remote direct submission must re-query lookup at execution time');
+assert.match(source, /await bridge\.send\(ExtensionProtocol\.MESSAGE_TYPES\.LOOKUP_QUESTION/, 'remote direct submission must re-query lookup at execution time');
 assert.match(source, /const target = matching\[0\];/, 'remote direct submission must use fresh current options');
-assert.match(source, /clickVisibleQuestionSubmit\(siteSubmit\)/, 'remote direct submission must click the live site submit button');
+assert.match(source, /clickVisibleTaskSubmit\(action\)/, 'remote direct submission must click the live site submit button');
 assert.match(source, /clearAnswerMarks\(optionNodes\)/, 'non-match states must clear marks');
 assert.match(source, /result\.status === 'unmatched' \|\| result\.status === 'ambiguous'/, 'ambiguous and unmatched must not auto-select');
 assert.match(source, /result\.optionIndex < 0 \|\| result\.optionIndex >= optionNodes\.length/, 'invalid indexes must clear marks and stop');

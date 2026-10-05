@@ -32,7 +32,7 @@ const questionUrl = 'https://www.1point3acres.com/next/daily-question';
 
 const makeHarness = ({ session = {}, local = {}, tabs = [], removeMode = 'normal', tabsGetMode = {}, sendMessageImpl = null, tabsCreateFails = false } = {}) => {
   const events = [];
-  const listeners = { message: null, startup: null, installed: null, updated: null, alarm: null, storageChanged: null };
+  const listeners = { message: null, startup: null, installed: null, updated: null, removed: null, alarm: null, storageChanged: null };
   let nextTabId = Math.max(0, ...tabs.map((t) => t.id || 0)) + 1;
   const tabMap = new Map(tabs.map((tab) => [tab.id, { ...tab }]));
   const alarms = new Map();
@@ -77,6 +77,7 @@ const makeHarness = ({ session = {}, local = {}, tabs = [], removeMode = 'normal
         return { ok: true, accepted: true, actionId: message.payload.actionId };
       },
       onUpdated: { addListener: (fn) => { listeners.updated = fn; } },
+      onRemoved: { addListener: (fn) => { listeners.removed = fn; } },
     },
     alarms: {
       create: async (name, info) => { alarms.set(name, { name, ...info }); },
@@ -1385,9 +1386,30 @@ const oneClickSends = (h, tabId) => h.events.filter((event) => (
     pageState: 'active',
   }, { tab: { id: tabId } });
   await flush();
-  assert.notEqual(runtime(h).run.currentActionId, firstActionId, 'ACTION_RESULT with pageState active must refresh without another CONTENT_READY');
+  assert.equal(runtime(h).run.currentActionId, firstActionId, 'captcha failure reporting an active page must stay paused');
+  assert.equal(oneClickSends(h, tabId).length, sendsBefore, 'the failure report must not immediately replay itself');
+  const failure = runtime(h).actionsByTabId[String(tabId)].lastResult;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await h.send('ACTION_RESULT', failure, { tab: { id: tabId } });
+    await h.send('CONTENT_READY', { pageState: 'active', pageKind: 'daily-checkin' }, { tab: { id: tabId } });
+  }
+  assert.equal(runtime(h).run.status, 'paused');
+  assert.equal(runtime(h).run.currentActionId, firstActionId, 'unchanged active reports must not mint another action');
+  assert.equal(oneClickSends(h, tabId).length, sendsBefore);
+  assert.equal(h.events.filter((event) => event[0] === 'notifications.create').length, 1, 'repeated captcha failures must notify once per run/stage');
+
+  // The notification guard must survive service-worker suspension/restart.
+  const resumed = makeHarness({ session: h.session, local: h.local, tabs: [...h.tabMap.values()] });
+  await resumed.send('ACTION_RESULT', failure, { tab: { id: tabId } });
+  assert.equal(resumed.events.filter((event) => event[0] === 'notifications.create').length, 0);
+  await h.send('CONTENT_READY', { pageState: 'captcha-required', pageKind: 'daily-checkin' }, { tab: { id: tabId } });
+  await h.send('ACTION_RESULT', failure, { tab: { id: tabId } });
+  await h.send('CONTENT_READY', { pageState: 'active', pageKind: 'daily-checkin' }, { tab: { id: tabId } });
+  assert.notEqual(runtime(h).run.currentActionId, firstActionId, 'a real observed challenge-to-active transition may resume');
   assert.equal(oneClickSends(h, tabId).length, sendsBefore + 1);
   assert.equal(oneClickSends(h, tabId).at(-1)[3].resumeMode, 'join');
+  await h.send('ACTION_RESULT', { ...failure, actionId: runtime(h).run.currentActionId }, { tab: { id: tabId } });
+  assert.equal(h.events.filter((event) => event[0] === 'notifications.create').length, 1, 'a fresh resume action ID must not repeat the same attention notification');
 }
 
 {
@@ -1411,6 +1433,41 @@ const oneClickSends = (h, tabId) => h.events.filter((event) => (
   assert.equal(runtime(blocked).run.status, 'paused');
   assert.equal(lastBadge(blocked), '!');
   assert.match(lastTitle(blocked), /Verify you are human/);
+}
+
+for (const action of ['checkin', 'question']) {
+  const h = makeHarness({ tabs: [{ id: 601, url: 'https://example.com', active: true }] });
+  await h.send('RUN_ONE_CLICK', { action });
+  const tabId = runtime(h).run.currentTabId;
+  const createdBefore = h.events.filter((event) => event[0] === 'tabs.create').length;
+  await h.listeners.removed(999);
+  assert.equal(runtime(h).run.status, 'running', 'closing an unrelated tab must not interrupt the run');
+  h.tabMap.delete(tabId);
+  await h.listeners.removed(tabId);
+  assert.equal(runtime(h).run.status, 'paused', `${action} must stop claiming to run after its tab closes`);
+  assert.equal(runtime(h).run.lastError, 'task-tab-closed');
+  await h.listeners.removed(tabId);
+  assert.equal(h.events.filter((event) => event[0] === 'tabs.create').length, createdBefore, 'tab removal must not reopen or replay the task');
+  assert.equal(h.events.filter((event) => event[0] === 'notifications.create').length, 0, 'tab removal must not produce repeated attention notifications');
+  const restarted = makeHarness({ session: h.session, local: h.local, tabs: [...h.tabMap.values()] });
+  await restarted.listeners.startup();
+  assert.equal(runtime(restarted).run.status, 'paused', 'worker restart must retain an explicitly closed task');
+  assert.equal(restarted.events.filter((event) => event[0] === 'tabs.create').length, 0);
+  await h.send('RUN_ONE_CLICK', { action });
+  assert.equal(runtime(h).run.status, 'running', 'an explicit retry must resume the paused run');
+  assert.notEqual(runtime(h).run.currentTabId, tabId);
+}
+
+{
+  const h = makeHarness({ tabs: [{ id: 610, url: 'https://example.com', active: true }] });
+  await h.send('RUN_ONE_CLICK', { action: 'everything' });
+  const checkinTabId = runtime(h).run.currentTabId;
+  const actionId = runtime(h).run.currentActionId;
+  await h.send('ACTION_RESULT', { action: 'checkin', actionId, status: 'success' }, { tab: { id: checkinTabId } });
+  await flush();
+  await h.listeners.removed(checkinTabId);
+  assert.notEqual(runtime(h).run.lastError, 'task-tab-closed', 'successful check-in finalization must still hand off to the question stage');
+  assert.equal(runtime(h).run.stage, 'question');
 }
 
 console.log('test-coordinator-lifecycle: ok');

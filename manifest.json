@@ -26,7 +26,8 @@
   "permissions": [
     "storage",
     "notifications",
-    "alarms"
+    "alarms",
+    "debugger"
   ],
   "host_permissions": [
     "https://1point3acres.com/*",

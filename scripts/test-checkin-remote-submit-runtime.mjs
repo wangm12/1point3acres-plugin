@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { mockTrustedSubmitTransport } from './helpers/mock-trusted-submit.mjs';
 
 const source = `${fs
   .readFileSync(new URL('../src/content.js', import.meta.url), 'utf8')
@@ -18,6 +19,7 @@ this.__runCheckinAction = runCheckinAction;
 this.__getLocalCheckinSubmitInFlight = () => (typeof localCheckinSubmitInFlight === 'undefined' ? false : localCheckinSubmitInFlight);
 this.__getCheckinActionKey = () => (typeof checkinActionKey === 'undefined' ? null : checkinActionKey);
 this.__clearCheckinPrepared = () => { checkinPrepared = null; };
+this.__renderCheckin = renderCheckin;
 `;
 
 const delay = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -135,23 +137,32 @@ const checkinNodeSignature = (node) => {
   return `${clean(node.textContent)}|${attrs}`;
 };
 
-const buildCheckinHarness = ({ holdSubmitResult = false } = {}) => {
+const buildCheckinHarness = ({ holdSubmitResult = false, autoStart = false, preselected = true, submitInitiallyReady = true, challenge = null, initialState = 'active' } = {}) => {
   let runtimeListener = null;
   const actionResults = [];
   let defaultClicks = 0;
   let submitClicks = 0;
-  let submitReady = true;
+  let submitReady = submitInitiallyReady;
 
   const body = makeElement('body');
   const main = makeElement('main');
   body.appendChild(main);
 
   const defaultMood = makeElement('button', '没心情');
-  defaultMood.setAttribute('aria-checked', 'true');
-  defaultMood.className = 'bg-primary';
+  if (preselected) {
+    defaultMood.setAttribute('aria-checked', 'true');
+    defaultMood.className = 'bg-primary';
+  }
   defaultMood.click = () => {
     defaultClicks += 1;
+    defaultMood.setAttribute('aria-checked', 'true');
   };
+  if (challenge) {
+    const iframe = makeElement('iframe');
+    iframe.setAttribute('src', 'https://challenges.cloudflare.com/turnstile');
+    iframe.setAttribute('title', challenge);
+    main.appendChild(iframe);
+  }
   const submit = makeElement('button', '提交签到');
   const completeCheckin = () => {
     body.innerText = '今日已签到，不能重复签到';
@@ -234,7 +245,7 @@ const buildCheckinHarness = ({ holdSubmitResult = false } = {}) => {
       findDefault: () => defaultMood,
       isDefaultSelected: (node = defaultMood) => node?.getAttribute?.('aria-checked') === 'true' || /(?:^|\s)bg-primary(?:\s|$)/.test(String(node?.className || '')),
       findSubmit: () => submitReady ? submit : null,
-      getState: () => (/今日已签到|已经签到|今日签到已完成|already checked.?in|already signed/i.test(String(body.innerText || body.textContent || ''))
+      getState: () => initialState !== 'active' ? initialState : (/今日已签到|已经签到|今日签到已完成|already checked.?in|already signed/i.test(String(body.innerText || body.textContent || ''))
         ? 'completed'
         : 'active'),
     },
@@ -263,8 +274,11 @@ const buildCheckinHarness = ({ holdSubmitResult = false } = {}) => {
   };
   context.window = context;
   context.globalThis = context;
+  context.trustedSubmit = mockTrustedSubmitTransport(context);
 
   vm.runInNewContext(source, context);
+  // Isolate manual-entry regressions from the separately tested page-load path.
+  if (!autoStart) vm.runInNewContext('checkinAutoSubmitAttempt = `${location.href}|${CheckinState.nodeSignature(DailyCheckinPage.findDefault())}`;', context);
 
   return {
     document,
@@ -296,6 +310,9 @@ const buildCheckinHarness = ({ holdSubmitResult = false } = {}) => {
     runLocalCheckinAction() {
       return context.__runCheckinAction();
     },
+    renderCheckin() {
+      context.__renderCheckin();
+    },
     findToolbarOneClick() {
       const bar = document.getElementById('p3a-daily-checkin-helper');
       return (bar?.querySelectorAll?.('button') || []).find((node) => node.textContent === '一键签到') || null;
@@ -316,6 +333,82 @@ const sendRemoteCheckin = (harness, actionId) => new Promise((resolve) => {
     resolve,
   );
 });
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, preselected: false });
+  await waitFor(() => harness.submitClicks === 1 && !harness.localCheckinSubmitInFlight, { message: 'opening a captcha-free page must automatically submit and finish' });
+  assert.equal(harness.defaultClicks, 1, 'automatic check-in must select the default mood once');
+  harness.renderCheckin();
+  assert.equal(harness.submitClicks, 1, 'completed page rerenders must not submit again');
+  assert.equal(harness.actionResults.length, 0, 'local automatic check-in must not invent a remote action');
+}
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, submitInitiallyReady: false });
+  await waitFor(() => harness.localCheckinSubmitInFlight, { message: 'automatic check-in must wait for the site button' });
+  harness.setSubmitReady(true);
+  await waitFor(() => harness.submitClicks === 1 && !harness.localCheckinSubmitInFlight, { message: 'automatic check-in must submit after the button becomes ready' });
+  assert.equal(harness.defaultClicks, 0, 'already-selected default mood must not be toggled');
+}
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, holdSubmitResult: true });
+  await waitFor(() => harness.submitClicks === 1, { message: 'automatic check-in must submit without a toolbar click' });
+  harness.renderCheckin();
+  harness.findToolbarOneClick().click();
+  await harness.runLocalCheckinAction();
+  const response = await sendRemoteCheckin(harness, 'remote-join-page-auto');
+  assertRemoteAccepted(response, 'popup must join a page automatic check-in');
+  await delay(20);
+  assert.equal(harness.submitClicks, 1, 'rerender, toolbar and popup must share the automatic submission');
+  harness.completeCheckin();
+  await waitFor(() => harness.actionResults.some((result) => result.actionId === 'remote-join-page-auto' && result.status === 'success'), { message: 'popup must receive the automatic submission result' });
+  await waitFor(() => !harness.localCheckinSubmitInFlight);
+}
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, challenge: 'Verify you are human' });
+  await waitFor(() => harness.findToolbarOneClick() && !harness.localCheckinSubmitInFlight);
+  assert.equal(harness.submitClicks, 0, 'interactive verification must block automatic submission');
+  harness.renderCheckin();
+  assert.equal(harness.localCheckinSubmitInFlight, false, 'rerender must not restart a blocked automatic attempt');
+  assert.equal(harness.submitClicks, 0);
+}
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, challenge: 'Widget containing a Cloudflare security challenge' });
+  await waitFor(() => harness.submitClicks === 1 && !harness.localCheckinSubmitInFlight, { message: 'passive Turnstile metadata must not block automatic check-in' });
+}
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, holdSubmitResult: true });
+  await waitFor(() => harness.submitClicks === 1 && !harness.localCheckinSubmitInFlight, { timeoutMs: 1000, message: 'unconfirmed automatic check-in must time out' });
+  harness.renderCheckin();
+  await delay(20);
+  assert.equal(harness.submitClicks, 1, 'timeout plus rerender must not retry automatically');
+  harness.findToolbarOneClick().click();
+  await waitFor(() => harness.submitClicks === 2, { message: 'manual retry must remain available after timeout' });
+  harness.completeCheckin();
+  await waitFor(() => !harness.localCheckinSubmitInFlight);
+}
+
+for (const initialState of ['completed', 'requires-login']) {
+  const harness = buildCheckinHarness({ autoStart: true, initialState });
+  await delay(10);
+  assert.equal(harness.defaultClicks, 0, `${initialState} page must not select a mood`);
+  assert.equal(harness.submitClicks, 0, `${initialState} page must not submit`);
+}
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, holdSubmitResult: true });
+  const response = await sendRemoteCheckin(harness, 'remote-timeout-before-page-auto');
+  assertRemoteAccepted(response, 'popup check-in arriving before page render must be accepted');
+  await waitFor(() => harness.actionResults.some((result) => result.actionId === 'remote-timeout-before-page-auto' && result.reason === 'timeout'), { timeoutMs: 1000, message: 'popup check-in must report its timeout' });
+  harness.renderCheckin();
+  await delay(20);
+  assert.equal(harness.submitClicks, 1, 'page automatic path must not resubmit after a popup timeout');
+  assert.equal(harness.localCheckinSubmitInFlight, false, 'popup failure must leave automatic page submission stopped');
+}
 
 {
   const harness = buildCheckinHarness({ holdSubmitResult: true });
@@ -391,6 +484,30 @@ const sendRemoteCheckin = (harness, actionId) => new Promise((resolve) => {
   harness.findToolbarOneClick().click();
   await waitFor(() => harness.submitClicks === 1, { message: 'toolbar 一键签到 must still submit when the mood is already selected' });
   assert.equal(harness.defaultClicks, clicksBefore, 'toolbar 一键签到 must not re-click an already selected default mood');
+  await waitFor(() => harness.document.getElementById('p3a-daily-checkin-helper')?.children.some((node) => node.textContent === '今日已签到，不能重复签到'), { message: 'manual completion must refresh toolbar status after the in-flight flag clears' });
+}
+
+{
+  const harness = buildCheckinHarness({ holdSubmitResult: true });
+  const confirm = await waitFor(() => harness.document.getElementById('p3a-daily-checkin-helper')?.children.find((node) => node.textContent === '确认并签到'));
+  confirm.click();
+  await waitFor(() => harness.submitClicks === 1);
+  confirm.click();
+  harness.findToolbarOneClick().click();
+  const response = await sendRemoteCheckin(harness, 'checkin-join-manual-confirm');
+  assertRemoteAccepted(response, 'popup must join manual check-in confirmation');
+  assert.equal(harness.submitClicks, 1, 'check-in confirmation, one-click and popup must use the same submission lock');
+  harness.completeCheckin();
+  await waitFor(() => harness.actionResults.some((result) => result.actionId === 'checkin-join-manual-confirm' && result.status === 'success'));
+}
+
+{
+  const harness = buildCheckinHarness();
+  harness.context.trustedSubmit.failWith('trusted-click-permission-required');
+  await sendRemoteCheckin(harness, 'missing-click-permission');
+  await waitFor(() => harness.actionResults.some((result) => result.actionId === 'missing-click-permission' && result.reason === 'trusted-click-permission-required'));
+  assert.equal(harness.submitClicks, 0, 'denied browser input must not fall back to an ignored synthetic click');
+  assert.equal(harness.context.DailyCheckinPage.findSubmit().getAttribute('data-p3a-submit-token'), null, 'temporary button marker must be removed after failure');
 }
 
 console.log('checkin remote submit runtime tests passed.');

@@ -16,7 +16,7 @@ assert.match(manifest.name, /[一-鿿]/);
 assert.match(manifest.description, /[一-鿿]/);
 assert.match(manifest.action.default_title, /[一-鿿]/);
 assert.equal(manifest.manifest_version, 3);
-assert.deepEqual(manifest.permissions, ['storage', 'notifications', 'alarms']);
+assert.deepEqual(manifest.permissions, ['storage', 'notifications', 'alarms', 'debugger']);
 assert.deepEqual(manifest.host_permissions, [
   'https://1point3acres.com/*',
   'https://www.1point3acres.com/*',
@@ -36,7 +36,7 @@ assert.match(readme, /不调用旧 Firebase/);
 assert.match(readme, /不绕过验证码或登录/);
 assert.match(readme, /不伪造站点请求/);
 assert.match(readme, /仅作个人本地使用/);
-assert.match(readme, /申请 `storage`、`notifications` 和 `alarms` 权限/);
+assert.match(readme, /申请 `storage`、`notifications`、`alarms` 和 `debugger` 权限/);
 assert.match(readme, /已签到.*继续答题/);
 assert.match(readme, /已答题.*视为完成/);
 assert.match(readme, /未登录：[\s\S]*验证码：[\s\S]*题库未收录：[\s\S]*多候选：/);

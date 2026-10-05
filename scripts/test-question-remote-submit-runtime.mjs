@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { mockTrustedSubmitTransport } from './helpers/mock-trusted-submit.mjs';
 
 const source = fs
   .readFileSync(new URL('../src/content.js', import.meta.url), 'utf8')
@@ -119,7 +120,7 @@ const makeElement = (tagName, text = '') => {
   return element;
 };
 
-const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, lookupTimeouts = 0, lookupStatus = 'matched', lookupReason = null, lookupMatchType = 'exact', hydrateOptionsAfterReads = 0, lookupDependsOnVisibleAnswer = false, holdSubmitResult = false, lookupDelayMs = 0, lookupStatusAfterFirst = null, interactiveChallenge = false } = {}) => {
+const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, lookupTimeouts = 0, lookupStatus = 'matched', lookupReason = null, lookupMatchType = 'exact', hydrateOptionsAfterReads = 0, lookupDependsOnVisibleAnswer = false, holdSubmitResult = false, lookupDelayMs = 0, lookupStatusAfterFirst = null, interactiveChallenge = false, preselected = true, selectionDelayMs = 0, submitInitiallyReady = true, initialState = 'active' } = {}) => {
   const answerText = '这些都有';
   const main = makeElement('main');
   const questionNode = makeElement('div', questionText);
@@ -133,7 +134,7 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
   let renderLookupRequestedAt = null;
   let renderLookupResolvedAt = null;
   let submitClickedAt = null;
-  let questionState = 'active';
+  let questionState = initialState;
 
   const optionNodes = [
     '美国大学各专业录取信息，留学途中的问题',
@@ -144,18 +145,25 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
     const node = makeElement('button', text);
     node.className = 'cursor-pointer rounded-md px-2.5 py-1.5 bg-gray-200 hover:bg-gray-300';
     node.addEventListener('click', () => {
-      for (const other of optionNodes) {
-        other.className = other === node ? 'rounded-md cursor-pointer bg-primary' : 'rounded-md cursor-pointer';
-      }
-      selectedNode = node;
+      const select = () => {
+        for (const other of optionNodes) {
+          other.className = other === node ? 'rounded-md cursor-pointer bg-primary' : 'rounded-md cursor-pointer';
+        }
+        selectedNode = node;
+      };
+      if (selectionDelayMs) setTimeout(select, selectionDelayMs);
+      else select();
     });
     return node;
   });
 
-  optionNodes[2].className = 'rounded-md cursor-pointer bg-primary';
-  selectedNode = optionNodes[2];
+  if (preselected) {
+    optionNodes[2].className = 'rounded-md cursor-pointer bg-primary';
+    selectedNode = optionNodes[2];
+  }
 
   const submitButton = makeElement('button', '提交答案');
+  submitButton.disabled = !submitInitiallyReady;
   submitButton.setAttribute('type', 'submit');
   const completeQuestion = () => {
     questionState = 'completed';
@@ -329,8 +337,9 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
   };
   context.window = context;
   context.globalThis = context;
+  context.trustedSubmit = mockTrustedSubmitTransport(context);
 
-  vm.runInNewContext(source, context);
+  vm.runInNewContext(`${source}\nthis.__renderQuestion = render; this.__getQuestionInFlight = () => localQuestionSubmitInFlight; this.__runQuestion = runQuestionAction;`, context);
 
   return {
     chrome,
@@ -364,6 +373,13 @@ const buildQuestionHarness = ({ questionText, changedAfterReads = Infinity, look
     },
     get actionResults() {
       return actionResults;
+    },
+    get inFlight() { return context.__getQuestionInFlight(); },
+    renderQuestion() { return context.__renderQuestion(); },
+    runLocalQuestion() { return context.__runQuestion(); },
+    setSubmitReady(ready) { submitButton.disabled = !ready; },
+    findToolbarButton(label) {
+      return document.getElementById('p3a-daily-question-helper')?.children.find((node) => node.textContent === label);
     },
     completeQuestion,
   };
@@ -615,6 +631,78 @@ assert.equal(
   });
   assert.equal(challenged.submitClicks, 0, 'question interactive challenge must not click the site submit');
   assert.equal(challenged.actionResults.some((result) => result.resumeMode === 'replay'), true, 'pre-submit question captcha must resume with replay');
+}
+
+{
+  const harness = buildQuestionHarness({ questionText: '异步选择题', preselected: false, selectionDelayMs: 5, submitInitiallyReady: false });
+  await waitFor(() => harness.inFlight, { message: 'exact page hit must start automatically before selection/button is ready' });
+  assert.equal(harness.submitClicks, 0, 'disabled site button must not be clicked');
+  harness.setSubmitReady(true);
+  await waitFor(() => harness.submitClicks === 1 && !harness.inFlight, { message: 'asynchronous site selection must finish without another DOM render' });
+  await harness.renderQuestion();
+  assert.equal(harness.submitClicks, 1, 'completed question rerender must not resubmit');
+}
+
+{
+  const harness = buildQuestionHarness({ questionText: '超时后不要重复答题', holdSubmitResult: true });
+  await waitFor(() => harness.submitClicks === 1);
+  await harness.renderQuestion();
+  harness.findToolbarButton('一键答题').click();
+  harness.findToolbarButton('确认并提交').click();
+  await harness.runLocalQuestion();
+  assert.equal(harness.submitClicks, 1, 'page rerender and toolbar clicks must join the active automatic attempt');
+  await waitFor(() => !harness.inFlight, { message: 'automatic question must eventually time out' });
+  await harness.renderQuestion();
+  await delay(5);
+  assert.equal(harness.submitClicks, 1, 'timeout must not cause automatic resubmission');
+  harness.findToolbarButton('一键答题').click();
+  await waitFor(() => harness.submitClicks === 2, { message: 'manual retry must remain available after timeout' });
+  harness.completeQuestion();
+  await waitFor(() => !harness.inFlight);
+}
+
+{
+  const harness = buildQuestionHarness({ questionText: '后台答题失败不要再自动提交', holdSubmitResult: true });
+  const response = await new Promise((resolve) => harness.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'question-remote-timeout-before-render' } }, {}, resolve,
+  ));
+  assertResponse(response, 'popup action before render must be accepted');
+  await waitFor(() => harness.actionResults.some((result) => result.reason === 'timeout'));
+  await harness.renderQuestion();
+  await delay(5);
+  assert.equal(harness.submitClicks, 1, 'popup timeout must consume the same page automatic attempt');
+  assert.equal(harness.inFlight, false);
+}
+
+{
+  const harness = buildQuestionHarness({ questionText: '相似题目需要人工确认', lookupMatchType: 'fuzzy', holdSubmitResult: true });
+  await waitFor(() => harness.findToolbarButton('选中答案'));
+  assert.equal(harness.submitClicks, 0, 'fuzzy hit must not automatically submit');
+  harness.findToolbarButton('选中答案').click();
+  harness.findToolbarButton('确认并提交').click();
+  await waitFor(() => harness.submitClicks === 1, { message: 'reviewed fuzzy answer must use the shared submit pipeline' });
+  harness.findToolbarButton('确认并提交').click();
+  const response = await new Promise((resolve) => harness.runtimeListenerFn(
+    { type: 'RUN_ONE_CLICK', payload: { action: 'question', actionId: 'question-join-manual-confirmation' } }, {}, resolve,
+  ));
+  assertResponse(response, 'popup must join manual confirmation');
+  assert.equal(harness.submitClicks, 1, 'manual confirmation must hold the same submission lock');
+  harness.completeQuestion();
+  await waitFor(() => harness.actionResults.some((result) => result.actionId === 'question-join-manual-confirmation' && result.status === 'success'));
+}
+
+for (const initialState of ['completed', 'requires-login']) {
+  const harness = buildQuestionHarness({ questionText: '不应提交的题目', initialState });
+  await delay(5);
+  assert.equal(harness.submitClicks, 0, `${initialState} page must not automatically submit`);
+}
+
+{
+  const harness = buildQuestionHarness({ questionText: '真实验证码停止自动答题', interactiveChallenge: true });
+  await waitFor(() => harness.findToolbarButton('一键答题') && !harness.inFlight);
+  assert.equal(harness.submitClicks, 0, 'interactive verification must block the exact page automatic path');
+  await harness.renderQuestion();
+  assert.equal(harness.inFlight, false, 'rerender must not restart blocked automatic answer submission');
 }
 
 console.log('question remote submit runtime tests passed.');
