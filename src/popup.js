@@ -30,6 +30,7 @@
     'answer-not-visible': { title: '当前选项不匹配', desc: '题库答案不在当前页面选项中，扩展未自动提交' },
     'answer-option-ambiguous': { title: '答案多候选', desc: '存在多个可能答案，请手动确认' },
     'default-option-not-found': { title: '未找到签到选项', desc: '未识别到默认心情选项，请手动签到' },
+    'default-option-not-selected': { title: '心情选择未生效', desc: '官网未确认选中心情，扩展未提交；请刷新页面后重试' },
     'question-fuzzy-match-requires-confirmation': { title: '需要人工确认答案', desc: '相似题目命中但不是精确题目，扩展未自动提交' },
     'timeout': { title: '任务超时', desc: '等待站点结果超时，请检查页面后重试' },
     'question-not-ready': { title: '题目未稳定', desc: '题目或选项未在时限内稳定，请刷新后重试' },

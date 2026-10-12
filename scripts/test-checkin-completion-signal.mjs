@@ -175,6 +175,7 @@ const buildCheckinHarness = ({ preselected = false, mutateSignatureOnClick = fal
   }
   defaultMood.click = () => {
     defaultClicks += 1;
+    defaultMood.setAttribute('aria-checked', 'true');
     if (mutateSignatureOnClick) defaultMood.setAttribute('data-value', `mutated-${defaultClicks}`);
     submitReady = false;
     queueMicrotask(() => { submitReady = true; });
@@ -645,6 +646,8 @@ const buildCaptchaHarness = ({ actionId, captchaText = '请输入验证码后继
   const submit = makeElement('button', '提交签到');
   submit.click = () => { submitClicks += 1; };
   let defaultMood = omitForm ? null : makeElement('button', '没心情');
+  const bindMoodSelection = (node) => node?.addEventListener('click', () => node.setAttribute('aria-checked', 'true'));
+  bindMoodSelection(defaultMood);
   if (!omitForm) {
     captchaMain.appendChild(submit);
     captchaMain.appendChild(defaultMood);
@@ -657,7 +660,7 @@ const buildCaptchaHarness = ({ actionId, captchaText = '请输入验证码后继
     captchaMain,
     submit,
     get defaultMood() { return defaultMood; },
-    setDefaultMood(node) { defaultMood = node; },
+    setDefaultMood(node) { defaultMood = node; bindMoodSelection(node); },
   };
   if (typeof decorate === 'function') decorate({ body, outerMain, captchaMain, submit, defaultMood, refs });
 
@@ -715,6 +718,7 @@ const buildCaptchaHarness = ({ actionId, captchaText = '请输入验证码后继
       TOOLBAR_ID: 'p3a-daily-checkin-helper',
       isCheckinPage: () => true,
       findDefault: () => defaultMood,
+      isDefaultSelected: (node = defaultMood) => node?.getAttribute('aria-checked') === 'true',
       findSubmit: () => (defaultMood ? submit : null),
       getState: () => 'active',
       nodeSignature: () => '',
@@ -1096,9 +1100,6 @@ const attachTurnstile = (parent, { title = '', src = 'https://challenges.cloudfl
       targetIframe = attachTurnstile(captchaMain, { title: 'Verifying...' });
     },
   });
-  setTimeout(() => {
-    targetIframe.setAttribute('title', 'Verify you are human');
-  }, 8);
   const response = await new Promise((resolve) => {
     harness.runtimeListener(
       { type: 'RUN_ONE_CLICK', payload: { action: 'checkin', actionId: harness.actionId } },
@@ -1107,6 +1108,8 @@ const attachTurnstile = (parent, { title = '', src = 'https://challenges.cloudfl
     );
   });
   assertRemoteAccepted(response, 'post-submit verify title command must be accepted');
+  await waitFor(() => harness.submitClicks === 1, { message: 'submit must happen before the post-submit verification prompt' });
+  targetIframe.setAttribute('title', 'Verify you are human');
   await waitFor(() => harness.actionResults.some((result) => result.reason === 'captcha-required' && result.resumeMode === 'join'), { timeoutMs: 1200, message: 'post-submit Verify title should report captcha-required with join' });
   assert.equal(harness.actionResults.some((result) => result.reason === 'timeout'), false, 'interactive widget must not fall through to timeout');
 }
@@ -1120,11 +1123,6 @@ const attachTurnstile = (parent, { title = '', src = 'https://challenges.cloudfl
       targetIframe = attachTurnstile(captchaMain);
     },
   });
-  setTimeout(() => {
-    targetIframe.setAttribute('title', 'Widget containing a Cloudflare security challenge');
-    harness.refs.captchaMain.innerText = '签到成功';
-    harness.refs.captchaMain.textContent = '签到成功';
-  }, 8);
   const response = await new Promise((resolve) => {
     harness.runtimeListener(
       { type: 'RUN_ONE_CLICK', payload: { action: 'checkin', actionId: harness.actionId } },
@@ -1133,6 +1131,10 @@ const attachTurnstile = (parent, { title = '', src = 'https://challenges.cloudfl
     );
   });
   assertRemoteAccepted(response, 'post-submit widget title command must be accepted');
+  await waitFor(() => harness.submitClicks === 1, { message: 'submit must happen before the post-submit widget outcome' });
+  targetIframe.setAttribute('title', 'Widget containing a Cloudflare security challenge');
+  harness.refs.captchaMain.innerText = '签到成功';
+  harness.refs.captchaMain.textContent = '签到成功';
   await waitFor(() => harness.actionResults.some((result) => result.status === 'success' && result.reason === 'completed'), { timeoutMs: 1200, message: 'Cloudflare widget title after submit should complete on success text' });
   assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-required'), false, 'passive widget title must not trigger captcha-required');
 }
@@ -1143,10 +1145,6 @@ const attachTurnstile = (parent, { title = '', src = 'https://challenges.cloudfl
     captchaText: '正在验证...',
     decorate: ({ captchaMain }) => { attachTurnstile(captchaMain); },
   });
-  setTimeout(() => {
-    harness.refs.captchaMain.innerText = '签到成功';
-    harness.refs.captchaMain.textContent = '签到成功';
-  }, 8);
   const response = await new Promise((resolve) => {
     harness.runtimeListener(
       { type: 'RUN_ONE_CLICK', payload: { action: 'checkin', actionId: harness.actionId } },
@@ -1155,6 +1153,9 @@ const attachTurnstile = (parent, { title = '', src = 'https://challenges.cloudfl
     );
   });
   assertRemoteAccepted(response, 'empty-title turnstile command must be accepted');
+  await waitFor(() => harness.submitClicks === 1, { message: 'submit must happen before the passive widget completion' });
+  harness.refs.captchaMain.innerText = '签到成功';
+  harness.refs.captchaMain.textContent = '签到成功';
   await waitFor(() => harness.actionResults.some((result) => result.status === 'success' && result.reason === 'completed'), { timeoutMs: 1200, message: 'empty-title Turnstile should still complete on success text' });
   assert.equal(harness.actionResults.some((result) => result.reason === 'captcha-required'), false, 'empty-title Turnstile must not report captcha-required');
 }
