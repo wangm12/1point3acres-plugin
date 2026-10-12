@@ -34,8 +34,6 @@ assert.match(answerAction, /question-not-ready/);
 assert.match(answerAction, /question-changed-or-unavailable/);
 assert.match(source, /const waitForQuestionSubmit = async/);
 assert.match(source, /QUESTION_SUBMIT_WAIT_MS/);
-assert.match(source, /const alreadySelected = Boolean\(CheckinState\.reconcile\(checkinPrepared, location\.href, current\)\)/);
-assert.match(source, /if \(!alreadySelected\) current\.click\(\)/);
 assert.match(source, /const waitForCheckinSubmit = async/);
 assert.match(source, /CHECKIN_SUBMIT_WAIT_MS/);
 assert.match(source, /reason: 'submit-timeout'/);
@@ -77,8 +75,6 @@ const checkinAction = checkin.slice(checkin.indexOf("oneClick.addEventListener('
 assert.match(checkinAction, /runCheckinAction\(\)/, 'toolbar must enter the shared check-in action');
 assert.doesNotMatch(checkin, /submit\.click\(\)|waitForRemoteResult/, 'check-in toolbar must not contain another submission pipeline');
 assert.match(runCheckinFn, /await submitTaskAndWait\([\s\S]*?action: 'checkin'/, 'check-in must use the common submission pipeline');
-assert.match(runCheckinFn, /if \(!alreadySelected\) current\.click\(\)/, 'shared action must preserve already-selected mood');
-assert.match(runCheckinFn, /await waitForCheckinSubmit\(\)/, 'shared action must wait for the site button');
 assert.match(runCheckinFn, /latestSignature !== signature/, 'shared action must reject changed moods');
 assert.match(runCheckinFn, /localCheckinSubmitInFlight = true/, 'shared action must own the local in-flight lock');
 assert.match(checkin, /if \(!checkinAutoAttempt\) \{[\s\S]*?DailyCheckinPage\.isDefaultSelected\(defaultNode\)/, 'auto-select must consult isDefaultSelected before clicking');

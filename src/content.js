@@ -110,12 +110,21 @@ const PENDING_REMOTE_RESULT_TTL_MS = 60 * 60 * 1000;
 const PENDING_REMOTE_RESULT_MAX = 16;
 const QUESTION_SUBMIT_WAIT_MS = 4000;
 const QUESTION_SUBMIT_POLL_MS = 100;
-const CHECKIN_SUBMIT_WAIT_MS = 2000;
+const CHECKIN_SUBMIT_WAIT_MS = 5000;
 const CHECKIN_SUBMIT_POLL_MS = 100;
+const CHECKIN_SELECT_RETRY_MS = 500;
 const QUESTION_LOOKUP_RESPONSE_TIMEOUT_MS = 1500;
 const QUESTION_LOOKUP_RETRY_DELAY_MS = 250;
 let questionStatusNode = null;
 let checkinStatusNode = null;
+let checkinLastActionStatus = '';
+const checkinActionStatus = {
+  get textContent() { return checkinLastActionStatus; },
+  set textContent(value) {
+    checkinLastActionStatus = String(value || '');
+    if (checkinStatusNode) checkinStatusNode.textContent = checkinLastActionStatus;
+  },
+};
 let lastReportedPageSignature = null;
 let pendingRemoteResultStore = null;
 let pendingRemoteResultStorePromise = null;
@@ -731,14 +740,35 @@ const waitForQuestionSubmit = async (questionKey, optionTexts, answerText) => {
   }
   return { ok: false, reason: 'submit-timeout' };
 };
-const waitForCheckinSubmit = async () => {
+const waitForCheckinSubmit = async (signature) => {
   const startedAt = Date.now();
+  let previousDefault = null;
+  let previousSubmit = null;
+  let lastSelectionAt = -Infinity;
+  let sawReadyControls = false;
   while (Date.now() - startedAt < CHECKIN_SUBMIT_WAIT_MS) {
+    const state = DailyCheckinPage.getState();
+    if (state !== 'active') return { reason: state };
+    if (hasPageCaptchaChallenge(getRemoteResultScope('checkin'), 'checkin')) return { reason: 'captcha-required' };
+    const current = DailyCheckinPage.findDefault();
     const submit = DailyCheckinPage.findSubmit();
-    if (submit && !submit.disabled && submit.isConnected !== false) return submit;
+    if (current && CheckinState.nodeSignature(current) !== signature) return { reason: 'checkin-changed-or-unavailable' };
+    const ready = current && current.isConnected !== false && submit && !submit.disabled && submit.isConnected !== false;
+    if (ready && current === previousDefault && submit === previousSubmit) {
+      sawReadyControls = true;
+      // Preparation is only acknowledged by the site's selection state. An
+      // early click can be ignored before React hydration attaches handlers.
+      if (DailyCheckinPage.isDefaultSelected?.(current) === true) return { button: submit };
+      if (Date.now() - lastSelectionAt >= CHECKIN_SELECT_RETRY_MS) {
+        lastSelectionAt = Date.now();
+        current.click();
+      }
+    }
+    previousDefault = ready ? current : null;
+    previousSubmit = ready ? submit : null;
     await new Promise((resolve) => setTimeout(resolve, CHECKIN_SUBMIT_POLL_MS));
   }
-  return null;
+  return { reason: sawReadyControls ? 'default-option-not-selected' : 'submit-not-found' };
 };
 // Every entry point submits through this function. Page-specific preparation
 // supplies a final live validation; challenge checks, click and result handling
@@ -1012,7 +1042,7 @@ const runCheckinAction = async ({ actionId = null, resumeMode = null } = {}) => 
   }
   const initialDefault = DailyCheckinPage.findDefault();
   if (initialDefault) checkinAutoSubmitAttempt = `${location.href}|${CheckinState.nodeSignature(initialDefault)}`;
-  const status = checkinStatusNode || { textContent: '' };
+  const status = checkinActionStatus;
   const failRemote = (reason, extra = {}) => {
     if (actionId) {
       finishRemoteAction(actionId, 'checkin', 'failed', reason, extra);
@@ -1075,13 +1105,35 @@ const runCheckinAction = async ({ actionId = null, resumeMode = null } = {}) => 
     checkinAutoSubmitAttempt = `${location.href}|${signature}`;
     const key = `${actionId || 'local'}:${location.href}:${signature}`;
     if (checkinActionKey === key) { failRemote('duplicate-action'); status.textContent = '已一键签到，等待站点结果'; return; }
-    const alreadySelected = Boolean(CheckinState.reconcile(checkinPrepared, location.href, current))
-      || DailyCheckinPage.isDefaultSelected?.(current) === true;
-    if (!alreadySelected) current.click();
-    // Selecting a mood can cause the site to re-render the submit button.
-    // Always resolve the live site-owned button after the selection event.
-    const submit = await waitForCheckinSubmit();
-    if (!submit) { failRemote('submit-not-found'); status.textContent = '未找到站点签到按钮，未提交'; return; }
+    status.textContent = '正在准备签到，等待官网确认选中心情';
+    // Wait for live controls and site-owned mood acknowledgement. Never use
+    // our prepared marker as evidence that the site's handlers ran.
+    const preparation = await waitForCheckinSubmit(signature);
+    if (preparation.reason === 'completed') {
+      finishRemoteAction(actionId, 'checkin', 'success', 'already-completed');
+      status.textContent = '已完成：今日已签到';
+      return;
+    }
+    if (preparation.reason === 'requires-login') {
+      if (actionId) pauseRemoteAction(actionId, 'checkin', 'requires-login');
+      else for (const id of [...pendingRemoteActions]) pauseRemoteAction(id, 'checkin', 'requires-login');
+      status.textContent = '需登录：登录后会自动继续签到';
+      return;
+    }
+    if (preparation.reason === 'captcha-required') {
+      failRemote('captcha-required', { resumeMode: 'replay', pageState: detectPageState() });
+      status.textContent = '页面需要安全验证，请手动完成，未提交';
+      return;
+    }
+    if (!preparation.button) {
+      failRemote(preparation.reason);
+      status.textContent = preparation.reason === 'default-option-not-selected'
+        ? '官网未确认选中心情，未提交，请重试'
+        : preparation.reason === 'checkin-changed-or-unavailable'
+          ? '签到页面或默认选项已变化，未提交'
+          : '未找到就绪的站点签到按钮，未提交';
+      return;
+    }
     const latestState = DailyCheckinPage.getState();
     const latestCurrent = DailyCheckinPage.findDefault();
     const latestSignature = CheckinState.nodeSignature(latestCurrent);
@@ -1092,7 +1144,8 @@ const runCheckinAction = async ({ actionId = null, resumeMode = null } = {}) => 
     }
     await submitTaskAndWait({
       action: 'checkin', actionId, status,
-      validate: () => CheckinState.nodeSignature(DailyCheckinPage.findDefault()) === signature,
+      validate: () => CheckinState.nodeSignature(DailyCheckinPage.findDefault()) === signature
+        && DailyCheckinPage.isDefaultSelected?.(DailyCheckinPage.findDefault()) === true,
       onSubmitted: () => { checkinActionKey = key; checkinPrepared = null; },
     });
     checkinActionKey = null;
@@ -1279,7 +1332,7 @@ const renderCheckin = () => {
   if (!isCheckinPage()) return;
   // Keep the current result status and controls while local or popup work runs.
   if (localCheckinSubmitInFlight || activeRemoteActionId || pendingRemoteActions.size) return;
-  const previousStatus = checkinStatusNode?.textContent;
+  const previousStatus = checkinStatusNode?.textContent || checkinLastActionStatus;
   const generation = ++checkinGeneration;
   let bar = document.getElementById(checkinToolbarId);
   if (!bar) { bar = document.createElement('section'); bar.id = checkinToolbarId; bar.setAttribute('role', 'region'); bar.setAttribute('aria-label', '每日签到助手'); document.body.appendChild(bar); }

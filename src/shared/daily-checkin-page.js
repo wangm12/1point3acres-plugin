@@ -77,7 +77,7 @@
     const state = String(node.getAttribute?.('data-state') || '').toLowerCase();
     if (state === 'selected' || state === 'checked' || state === 'on') return true;
     const classes = String(node.className?.baseVal || node.className || '');
-    if (/(?:^|\s)(?:bg-primary|ring-primary|border-primary)(?:\s|$)/.test(classes)) return true;
+    if (/(?:^|\s)(?:bg-primary(?:-soft)?|ring-primary|border-primary)(?:\s|$)/.test(classes)) return true;
     if (node.querySelector?.('input')?.checked === true) return true;
     if (node.closest?.('label')?.querySelector?.('input')?.checked === true) return true;
     return false;

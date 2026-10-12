@@ -11,8 +11,9 @@ const source = `${fs
   .replace('const REMOTE_RESULT_TIMEOUT_MS = 16000;', 'const REMOTE_RESULT_TIMEOUT_MS = 400;')
   .replace('const CAPTCHA_GRACE_PERIOD_MS = 10000;', 'const CAPTCHA_GRACE_PERIOD_MS = 20;')
   .replace('const REMOTE_RESULT_REPORT_DELAY_MS = 200;', 'const REMOTE_RESULT_REPORT_DELAY_MS = 1;')
-  .replace('const CHECKIN_SUBMIT_WAIT_MS = 2000;', 'const CHECKIN_SUBMIT_WAIT_MS = 50;')
+  .replace('const CHECKIN_SUBMIT_WAIT_MS = 5000;', 'const CHECKIN_SUBMIT_WAIT_MS = 50;')
   .replace('const CHECKIN_SUBMIT_POLL_MS = 100;', 'const CHECKIN_SUBMIT_POLL_MS = 1;')
+  .replace('const CHECKIN_SELECT_RETRY_MS = 500;', 'const CHECKIN_SELECT_RETRY_MS = 5;')
   .replace('}, 180);', '}, 1);')
   .replace('}, 200);', '}, 1);')}
 this.__runCheckinAction = runCheckinAction;
@@ -137,7 +138,7 @@ const checkinNodeSignature = (node) => {
   return `${clean(node.textContent)}|${attrs}`;
 };
 
-const buildCheckinHarness = ({ holdSubmitResult = false, autoStart = false, preselected = true, submitInitiallyReady = true, challenge = null, initialState = 'active' } = {}) => {
+const buildCheckinHarness = ({ holdSubmitResult = false, autoStart = false, preselected = true, submitInitiallyReady = true, challenge = null, initialState = 'active', ignoredMoodClicks = 0, requireSelectedMood = false } = {}) => {
   let runtimeListener = null;
   const actionResults = [];
   let defaultClicks = 0;
@@ -155,6 +156,7 @@ const buildCheckinHarness = ({ holdSubmitResult = false, autoStart = false, pres
   }
   defaultMood.click = () => {
     defaultClicks += 1;
+    if (defaultClicks <= ignoredMoodClicks) return;
     defaultMood.setAttribute('aria-checked', 'true');
   };
   if (challenge) {
@@ -170,6 +172,7 @@ const buildCheckinHarness = ({ holdSubmitResult = false, autoStart = false, pres
   };
   submit.click = () => {
     submitClicks += 1;
+    if (requireSelectedMood && defaultMood.getAttribute('aria-checked') !== 'true') return;
     if (!holdSubmitResult) queueMicrotask(completeCheckin);
   };
 
@@ -318,6 +321,12 @@ const buildCheckinHarness = ({ holdSubmitResult = false, autoStart = false, pres
       return (bar?.querySelectorAll?.('button') || []).find((node) => node.textContent === '一键签到') || null;
     },
     completeCheckin,
+    showChallenge() {
+      const iframe = makeElement('iframe');
+      iframe.setAttribute('src', 'https://challenges.cloudflare.com/turnstile');
+      iframe.setAttribute('title', 'Verify you are human');
+      main.appendChild(iframe);
+    },
   };
 };
 
@@ -349,6 +358,43 @@ const sendRemoteCheckin = (harness, actionId) => new Promise((resolve) => {
   harness.setSubmitReady(true);
   await waitFor(() => harness.submitClicks === 1 && !harness.localCheckinSubmitInFlight, { message: 'automatic check-in must submit after the button becomes ready' });
   assert.equal(harness.defaultClicks, 0, 'already-selected default mood must not be toggled');
+}
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, preselected: false, ignoredMoodClicks: 1, requireSelectedMood: true });
+  await waitFor(() => harness.submitClicks === 1 && !harness.localCheckinSubmitInFlight, { timeoutMs: 1000, message: 'an ignored initial mood click must be recovered before submission' });
+  assert.equal(harness.defaultClicks, 2, 'the extension must wait for site-owned mood acknowledgement rather than its own prepared marker');
+  assert.equal(harness.context.DailyCheckinPage.getState(), 'completed', 'automatic submission must complete after selecting the mood');
+}
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, preselected: false, ignoredMoodClicks: 100, requireSelectedMood: true });
+  await waitFor(() => harness.findToolbarOneClick() && !harness.localCheckinSubmitInFlight);
+  assert.equal(harness.submitClicks, 0, 'unacknowledged mood selection must never be submitted');
+  harness.renderCheckin();
+  const status = harness.document.getElementById('p3a-daily-checkin-helper')?.children[0]?.textContent;
+  assert.match(status, /官网未确认选中心情/, 'readiness failure must stay visible after rerender');
+  const clicksBefore = harness.defaultClicks;
+  await delay(20);
+  assert.equal(harness.defaultClicks, clicksBefore, 'a failed preparation must not restart automatically on rerender');
+}
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, preselected: false, ignoredMoodClicks: 100 });
+  await waitFor(() => harness.localCheckinSubmitInFlight);
+  harness.showChallenge();
+  const clicksBefore = harness.defaultClicks;
+  await waitFor(() => !harness.localCheckinSubmitInFlight);
+  assert.equal(harness.defaultClicks, clicksBefore, 'an interactive challenge appearing during preparation must stop mood retries');
+  assert.equal(harness.submitClicks, 0, 'an interactive challenge appearing during preparation must block submission');
+}
+
+{
+  const harness = buildCheckinHarness({ autoStart: true, submitInitiallyReady: false });
+  await waitFor(() => harness.localCheckinSubmitInFlight);
+  harness.completeCheckin();
+  await waitFor(() => !harness.localCheckinSubmitInFlight);
+  assert.equal(harness.submitClicks, 0, 'a task completed elsewhere during preparation must not be submitted again');
 }
 
 {
@@ -408,6 +454,7 @@ for (const initialState of ['completed', 'requires-login']) {
   await delay(20);
   assert.equal(harness.submitClicks, 1, 'page automatic path must not resubmit after a popup timeout');
   assert.equal(harness.localCheckinSubmitInFlight, false, 'popup failure must leave automatic page submission stopped');
+  assert(harness.document.getElementById('p3a-daily-checkin-helper')?.children.some((node) => /尚未确认完成/.test(node.textContent)), 'a pre-toolbar timeout must remain visible instead of claiming the user only needs to confirm');
 }
 
 {
